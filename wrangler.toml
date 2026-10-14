@@ -1,0 +1,13 @@
+name = "new_website_data"
+main = "src/index.ts"
+compatibility_date = "2026-05-31"
+
+[[routes]]
+pattern = "gateway.andrewwangdev.com"
+zone_name = "andrewwangdev.com"
+custom_domain = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "panic_design"
+database_id = "9fdbf072-3820-4c3b-9aa5-a18672f4ff44"
