@@ -256,8 +256,17 @@ app.all('*', async (c) => {
     url.protocol = 'https:'
     url.port = ''
     
+    // Strip chaos token query param to prevent leaking credentials to upstream service
+    url.searchParams.delete('token')
+
     const headers = new Headers(c.req.raw.headers)
     headers.set('Host', targetHost)
+
+    // Strip incoming chaos Authorization header if it matched our token
+    const incomingAuth = headers.get('Authorization')
+    if (incomingAuth && incomingAuth === `Bearer ${token}`) {
+      headers.delete('Authorization')
+    }
 
     const newReq = new Request(url.toString(), {
       method: c.req.method,
@@ -371,8 +380,8 @@ function logTelemetryAsync(c: any, payload: any, latencyAdded: number, targetUrl
         .run(),
         
       // Insert Chaos Log
-      c.env.DB.prepare('INSERT INTO ChaosLog (id, userId, targetUrl, faultInjected, latencyAdded, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
-        .bind(crypto.randomUUID(), userId, targetUrl, fault, latencyAdded, isoTime)
+      c.env.DB.prepare('INSERT INTO ChaosLog (id, userId, targetUrl, injectedFault, executedAt) VALUES (?, ?, ?, ?, ?)')
+        .bind(crypto.randomUUID(), userId, targetUrl, fault, isoTime)
         .run(),
         
       // Upsert Usage (D1 supports ON CONFLICT for SQLite)

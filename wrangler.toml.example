@@ -1,0 +1,15 @@
+name = "panic-design-gateway"
+main = "src/index.ts"
+compatibility_date = "2026-05-31"
+
+# [Optional] Custom domain configuration:
+# [[routes]]
+# pattern = "gateway.yourdomain.com"
+# zone_name = "yourdomain.com"
+# custom_domain = true
+
+# D1 Database binding for Token revocation, quota usage, and chaos logs:
+[[d1_databases]]
+binding = "DB"
+database_name = "panic_design"
+database_id = "your-cloudflare-d1-database-id"
