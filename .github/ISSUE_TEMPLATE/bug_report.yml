@@ -1,0 +1,66 @@
+name: "Bug Report"
+description: "Report edge proxy bugs, header stripping anomalies, or telemetry issues"
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue with the Panic Design Gateway.
+        > **Security Warning**: For vulnerabilities (e.g. signature bypass, SSRF, secret leak), please report privately via [GitHub Security Advisories](https://github.com/AndrewWangDev/Panic_Design_Gateway/security/advisories/new) or email `security@andrewwangdev.com`.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      options:
+        - "JWT Cryptographic Verification"
+        - "D1 Global Revocation Check"
+        - "Fault Injection Engine (Latency / Jitter / Drops)"
+        - "L7 Response Mutilation"
+        - "SSRF & Target Host Guardrails"
+        - "Asynchronous D1 Telemetry"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      placeholder: "When forwarding requests to an upstream target, the gateway..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Issue a chaos token for target '...'
+        2. Execute: curl -i 'https://gateway.andrewwangdev.com/?token=...'
+        3. Observe response...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      placeholder: "The gateway should forward headers without leaking..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Terminal / Curl Output
+      description: Redact any sensitive tokens before pasting.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: "I have confirmed no real secrets or unredacted tokens are in this report."
+          required: true

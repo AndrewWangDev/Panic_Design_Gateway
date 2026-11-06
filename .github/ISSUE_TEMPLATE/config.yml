@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "🔒 Security Vulnerability Reporting"
+    url: "https://github.com/AndrewWangDev/Panic_Design_Gateway/security/advisories/new"
+    about: "Report edge gateway vulnerabilities privately under Coordinated Vulnerability Disclosure."
+  - name: "💬 Community Discussions & Questions"
+    url: "https://github.com/AndrewWangDev/panic_design/discussions"
+    about: "Discuss global chaos architecture, edge deployments, and roadmap proposals."

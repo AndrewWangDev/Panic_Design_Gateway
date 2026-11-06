@@ -48,6 +48,11 @@ app.all('*', async (c) => {
       return c.text('Panic Gateway: Malformed Chaos Token', 400)
     }
 
+    // Zero-Trust Second-Layer SSRF Defense: validate target host against private networks
+    if (!isSafeTargetHost(targetHost)) {
+      return c.text('Panic Gateway: Forbidden Target Host (SSRF Blocked)', 400)
+    }
+
     if (c.env.DB) {
       // Check revocation and salt
       try {
@@ -251,10 +256,28 @@ app.all('*', async (c) => {
     } // End if (!failOpenMode)
 
     // Step 4: Proxy request
+    let targetHostname = targetHost;
+    let targetPort = '';
+
+    if (targetHost.startsWith('[')) {
+      // Bracketed IPv6, e.g. [2606::1]:8080 or [2606::1]
+      const match = targetHost.match(/^(\[[0-9a-fA-F:]+\])(?::(\d+))?$/);
+      if (match) {
+        targetHostname = match[1];
+        if (match[2]) targetPort = match[2];
+      }
+    } else if (targetHost.includes(':')) {
+      const parts = targetHost.split(':');
+      if (parts.length === 2 && !targetHost.includes('::')) {
+        targetHostname = parts[0];
+        targetPort = parts[1];
+      }
+    }
+
     const url = new URL(c.req.url)
-    url.host = targetHost
+    url.hostname = targetHostname
     url.protocol = 'https:'
-    url.port = ''
+    url.port = targetPort
     
     // Strip chaos token query param to prevent leaking credentials to upstream service
     url.searchParams.delete('token')
@@ -357,7 +380,8 @@ app.all('*', async (c) => {
       });
     }
   } catch (globalErr: any) {
-    return c.text(`Worker Global Exception: ${globalErr.message}\nStack: ${globalErr.stack}`, 500);
+    console.error('Panic Gateway Global Exception:', globalErr);
+    return c.text('Panic Gateway: Internal Proxy Error', 500);
   }
 })
 
@@ -420,6 +444,127 @@ function getColoCoordinates(colo: string): string {
   }
   // Fallback if unknown
   return '0,0';
+}
+
+/**
+ * Zero-Trust Second-Layer Guardrail:
+ * Validates target host to prevent SSRF against loopback, cloud metadata, or private RFC1918 subnets.
+ */
+export function isSafeTargetHost(rawHost: string): boolean {
+  if (!rawHost || typeof rawHost !== 'string') return false;
+  const host = rawHost.trim().toLowerCase();
+
+  // 1. Strict rejection of protocols, paths, queries, fragments, credentials
+  if (/[/?#@\\]/.test(host)) return false;
+
+  // 2. Extract host and optional port
+  let hostname = host;
+  if (host.startsWith('[')) {
+    const match = host.match(/^\[([0-9a-f:]+)\](?::(\d{1,5}))?$/);
+    if (!match) return false;
+    if (match[2]) {
+      const port = Number(match[2]);
+      if (isNaN(port) || port < 1 || port > 65535) return false;
+    }
+    const ip = match[1];
+    return !isPrivateIp(ip);
+  }
+
+  if (host.includes(':')) {
+    if (!host.includes('::') && host.split(':').length === 2) {
+      const parts = host.split(':');
+      if (!/^\d+$/.test(parts[1])) return false;
+      const port = Number(parts[1]);
+      if (isNaN(port) || port < 1 || port > 65535) return false;
+      hostname = parts[0];
+    }
+  }
+
+  // 3. Length checks
+  if (hostname.length === 0 || hostname.length > 253) return false;
+
+  // 4. Block localhost, internal, metadata domains
+  const blockedExact = new Set([
+    'localhost',
+    'metadata',
+    'metadata.google.internal',
+    'instance-data',
+    'router',
+    'gateway',
+    'broadcasthost'
+  ]);
+  if (blockedExact.has(hostname)) return false;
+
+  const blockedSuffixes = [
+    '.localhost',
+    '.local',
+    '.internal',
+    '.arpa',
+    '.invalid',
+    '.test',
+    '.example',
+    '.onion',
+    '.corp',
+    '.home',
+    '.lan'
+  ];
+  for (const suffix of blockedSuffixes) {
+    if (hostname.endsWith(suffix)) return false;
+  }
+
+  // 5. Bare IPv6 address
+  if (hostname.includes(':')) {
+    return !isPrivateIp(hostname);
+  }
+
+  // 6. IPv4 address
+  if (/^[0-9.]+$/.test(hostname)) {
+    return !isPrivateIp(hostname);
+  }
+
+  // 7. FQDN syntax (must have at least one dot to prevent internal machine names)
+  if (!hostname.includes('.')) return false;
+  const labels = hostname.split('.');
+  if (labels.some(l => l.length === 0 || l.length > 63)) return false;
+  for (const label of labels) {
+    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(label)) return false;
+  }
+
+  return true;
+}
+
+export function isPrivateIp(ip: string): boolean {
+  if (!ip) return true;
+
+  // IPv6
+  if (ip.includes(':')) {
+    const clean = ip.toLowerCase();
+    if (clean === '::1' || clean === '::') return true;
+    if (clean.startsWith('fe80:') || clean.startsWith('fe8') || clean.startsWith('fe9') || clean.startsWith('fea') || clean.startsWith('feb')) return true; // fe80::/10
+    if (clean.startsWith('fc00:') || clean.startsWith('fd')) return true; // fc00::/7
+    if (clean.startsWith('::ffff:')) {
+      const v4 = clean.replace('::ffff:', '');
+      return isPrivateIp(v4);
+    }
+    return false;
+  }
+
+  // IPv4
+  const parts = ip.split('.');
+  if (parts.length !== 4) return true;
+  const nums = parts.map(Number);
+  if (nums.some(n => isNaN(n) || n < 0 || n > 255)) return true;
+
+  const [b0, b1] = nums;
+  if (b0 === 0) return true; // 0.0.0.0/8
+  if (b0 === 10) return true; // 10.0.0.0/8
+  if (b0 === 127) return true; // 127.0.0.0/8 loopback
+  if (b0 === 169 && b1 === 254) return true; // 169.254.0.0/16
+  if (b0 === 172 && b1 >= 16 && b1 <= 31) return true; // 172.16.0.0/12
+  if (b0 === 192 && b1 === 168) return true; // 192.168.0.0/16
+  if (b0 === 100 && b1 >= 64 && b1 <= 127) return true; // 100.64.0.0/10 carrier NAT
+  if (b0 >= 224) return true; // 224.0.0.0/4 multicast & reserved
+  return false;
 }
 
 export default app
