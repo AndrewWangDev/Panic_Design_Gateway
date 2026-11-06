@@ -21,6 +21,8 @@ node_modules/
 *.pem
 *.key
 gen.cjs
+wrangler.toml
+wrangler.toml.local_backup
 
 # logs
 logs/
