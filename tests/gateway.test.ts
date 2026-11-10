@@ -71,6 +71,7 @@ describe('Data Plane: Target Host & SSRF Guardrails', () => {
     expect(isSafeTargetHost('8.8.8.8:443')).toBe(true);
     expect(isSafeTargetHost('[2606:4700:4700::1111]')).toBe(true);
     expect(isSafeTargetHost('[2606:4700:4700::1111]:8443')).toBe(true);
+    expect(isSafeTargetHost('2606:4700::1111')).toBe(true);
   });
 });
 
@@ -120,5 +121,21 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     expect(body.error.code).toBe('bad_gateway');
     expect(body.error.reason).toContain('Chaos Intercept');
     expect(res.headers.get('x-panic-colo')).toBeDefined();
+  });
+
+  it('should sanitize 502 response when upstream origin connection fails', async () => {
+    // Target an unreachable public endpoint to trigger fetch failure
+    const token = await generateTestToken({ 
+      targetHost: '2606:4700::1111',
+      fault: 'latency',
+      latency: 0
+    });
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+    expect(res.status).toBe(502);
+    const body = await res.json() as any;
+    expect(body.error.code).toBe('bad_gateway');
+    expect(body.error.message).toContain('Edge proxy was unable to establish a connection');
+    expect(body.error.target).toBe('2606:4700::1111');
+    expect(res.headers.get('content-type')).toContain('application/json');
   });
 });
