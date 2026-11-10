@@ -271,6 +271,10 @@ app.all('*', async (c) => {
       if (parts.length === 2 && !targetHost.includes('::')) {
         targetHostname = parts[0];
         targetPort = parts[1];
+      } else {
+        // Bare IPv6 (e.g. 2606:4700::1111): WHATWG URL requires brackets for IPv6 hostnames
+        targetHostname = `[${targetHost}]`;
+        targetPort = '';
       }
     }
 
@@ -374,9 +378,20 @@ app.all('*', async (c) => {
 
       return newRes;
     } catch (err: any) {
-      return new Response(`Panic Gateway: Proxy Fetch Failed - ${err.message}`, { 
+      console.error('Panic Gateway Proxy Origin Error:', err);
+      return new Response(JSON.stringify({
+        error: {
+          code: "bad_gateway",
+          message: "Edge proxy was unable to establish a connection to the upstream origin.",
+          target: targetHost
+        },
+        trace: {
+          ray_id: rayId,
+          edge_colo: currentColo
+        }
+      }, null, 2), { 
         status: 502,
-        headers: buildHeaders(finalDelay, 0)
+        headers: Object.assign({ 'Content-Type': 'application/json' }, buildHeaders(finalDelay, 0))
       });
     }
   } catch (globalErr: any) {
