@@ -72,6 +72,17 @@ describe('Data Plane: Target Host & SSRF Guardrails', () => {
     expect(isSafeTargetHost('[2606:4700:4700::1111]')).toBe(true);
     expect(isSafeTargetHost('[2606:4700:4700::1111]:8443')).toBe(true);
     expect(isSafeTargetHost('2606:4700::1111')).toBe(true);
+    expect(isSafeTargetHost('123.example.com')).toBe(true);
+  });
+
+  it('should block obfuscated octal, hex, integer, and mapped IPv6 SSRF hosts', () => {
+    expect(isSafeTargetHost('0177.0.0.1')).toBe(false);
+    expect(isSafeTargetHost('0x7f.0.0.1')).toBe(false);
+    expect(isSafeTargetHost('2130706433')).toBe(false);
+    expect(isSafeTargetHost('::ffff:7f00:0001')).toBe(false);
+    expect(isSafeTargetHost('[::ffff:7f00:0001]')).toBe(false);
+    expect(isSafeTargetHost('fec0::1')).toBe(false);
+    expect(isSafeTargetHost('0:0:0:0:0:0:0:1')).toBe(false);
   });
 });
 
@@ -137,5 +148,43 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     expect(body.error.message).toContain('Edge proxy was unable to establish a connection');
     expect(body.error.target).toBe('2606:4700::1111');
     expect(res.headers.get('content-type')).toContain('application/json');
+  });
+
+  it('should fail closed (503) when D1 revocation check throws a database error', async () => {
+    const token = await generateTestToken({ fault: '429' });
+    const failingDbEnv = {
+      AUTH_SECRET: TEST_SECRET,
+      DB: {
+        prepare: () => ({
+          bind: () => ({
+            first: async () => {
+              throw new Error('D1 connection timeout');
+            }
+          })
+        })
+      } as any
+    };
+
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, failingDbEnv);
+    expect(res.status).toBe(503);
+    expect(await res.text()).toContain('Revocation check unavailable');
+  });
+
+  it('should reject revoked token when D1 returns isRevoked=1', async () => {
+    const token = await generateTestToken({ fault: '429', issuedWithSalt: 1 });
+    const revokedDbEnv = {
+      AUTH_SECRET: TEST_SECRET,
+      DB: {
+        prepare: () => ({
+          bind: () => ({
+            first: async () => ({ jwtSalt: 1, isRevoked: 1 })
+          })
+        })
+      } as any
+    };
+
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, revokedDbEnv);
+    expect(res.status).toBe(401);
+    expect(await res.text()).toContain('Token has been revoked');
   });
 });
