@@ -72,6 +72,7 @@ app.all('*', async (c) => {
         }
       } catch (dbErr) {
         console.error('Panic Gateway DB Check Error:', dbErr);
+        return c.text('Panic Gateway: Revocation check unavailable', 503);
       }
     }
 
@@ -287,12 +288,16 @@ app.all('*', async (c) => {
     url.searchParams.delete('token')
 
     const headers = new Headers(c.req.raw.headers)
+    stripHopByHopHeaders(headers)
     headers.set('Host', targetHost)
 
     // Strip incoming chaos Authorization header if it matched our token
     const incomingAuth = headers.get('Authorization')
     if (incomingAuth && incomingAuth === `Bearer ${token}`) {
       headers.delete('Authorization')
+    }
+    if (['GET', 'HEAD'].includes(c.req.method)) {
+      headers.delete('content-length')
     }
 
     const newReq = new Request(url.toString(), {
@@ -316,49 +321,68 @@ app.all('*', async (c) => {
 
       let resBody: any = response.body;
       const newHeaders = new Headers(response.headers);
+      stripHopByHopHeaders(newHeaders);
       const mutilation = payload.mutilationStrategy || 'None';
+      const MAX_MUTILATION_BYTES = 2 * 1024 * 1024; // 2MB Worker memory safety cap
 
       if (!failOpenMode && fault === 'latency' && mutilation !== 'None') {
-        const rawText = await response.text();
-        newHeaders.delete('content-length');
-        newHeaders.delete('content-encoding');
-
-        if (mutilation === 'Unexpected EOF') {
-          const cutIndex = Math.floor(rawText.length * 0.7);
-          resBody = rawText.substring(0, cutIndex) + '\n\n... [ERR_TCP_RESET: CONNECTION_DROPPED_BY_PEER]';
-        } else if (mutilation === 'Empty Shell') {
+        if (mutilation === 'Empty Shell') {
+          await response.body?.cancel().catch(() => {});
+          newHeaders.delete('content-length');
+          newHeaders.delete('content-encoding');
+          newHeaders.set('content-type', 'application/json');
           resBody = JSON.stringify({
             data: null,
             items: [],
             metadata: { total: 0, page: 1 },
             _chaos_intercept: "Memory corruption simulated. Payload nullified."
           }, null, 2);
-        } else if (mutilation === 'Type Poisoning') {
-          try {
-            const ast = JSON.parse(rawText);
-            const poison = (obj: any) => {
-              if (Array.isArray(obj)) {
-                obj.forEach(poison);
-              } else if (obj && typeof obj === 'object') {
-                for (let k in obj) {
-                  if (typeof obj[k] === 'number') {
-                    obj[k] = String(obj[k]) + "_Poisoned";
-                  } else if (typeof obj[k] === 'boolean') {
-                    obj[k] = String(obj[k]);
-                  } else if (typeof obj[k] === 'object') {
-                    poison(obj[k]);
-                  }
-                }
-              }
-            };
-            poison(ast);
-            resBody = JSON.stringify(ast, null, 2);
-          } catch (e) {
-            // Not JSON, fallback to rawText
-            resBody = rawText;
-          }
         } else {
-          resBody = rawText;
+          const contentLen = Number(response.headers.get('content-length'));
+          if (!isNaN(contentLen) && contentLen > MAX_MUTILATION_BYTES) {
+            newHeaders.set('X-Chaos-Mutation-Skipped', 'Payload exceeds 2MB limit');
+          } else {
+            const readRes = await readBodyUpToLimit(response, MAX_MUTILATION_BYTES);
+            if (readRes.exceeded) {
+              resBody = readRes.stream;
+              newHeaders.set('X-Chaos-Mutation-Skipped', 'Payload exceeds 2MB limit');
+            } else {
+              const rawText = readRes.text || '';
+              newHeaders.delete('content-length');
+              newHeaders.delete('content-encoding');
+
+              if (mutilation === 'Unexpected EOF') {
+                const cutIndex = Math.floor(rawText.length * 0.7);
+                resBody = rawText.substring(0, cutIndex) + '\n\n... [ERR_TCP_RESET: CONNECTION_DROPPED_BY_PEER]';
+              } else if (mutilation === 'Type Poisoning') {
+                try {
+                  const ast = JSON.parse(rawText);
+                  const poison = (obj: any) => {
+                    if (Array.isArray(obj)) {
+                      obj.forEach(poison);
+                    } else if (obj && typeof obj === 'object') {
+                      for (const k in obj) {
+                        if (typeof obj[k] === 'number') {
+                          obj[k] = String(obj[k]) + "_Poisoned";
+                        } else if (typeof obj[k] === 'boolean') {
+                          obj[k] = String(obj[k]);
+                        } else if (typeof obj[k] === 'object') {
+                          poison(obj[k]);
+                        }
+                      }
+                    }
+                  };
+                  poison(ast);
+                  resBody = JSON.stringify(ast, null, 2);
+                } catch {
+                  // Not JSON or depth overflow, fallback to rawText
+                  resBody = rawText;
+                }
+              } else {
+                resBody = rawText;
+              }
+            }
+          }
         }
       }
 
@@ -461,6 +485,103 @@ function getColoCoordinates(colo: string): string {
   return '0,0';
 }
 
+function stripHopByHopHeaders(headers: Headers): void {
+  const connectionVal = headers.get('connection');
+  if (connectionVal) {
+    for (const name of connectionVal.split(',')) {
+      const trimmed = name.trim();
+      if (trimmed) headers.delete(trimmed);
+    }
+  }
+  const hopByHop = [
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailers',
+    'transfer-encoding',
+    'upgrade'
+  ];
+  for (const h of hopByHop) {
+    headers.delete(h);
+  }
+}
+
+async function readBodyUpToLimit(
+  res: Response,
+  maxBytes: number
+): Promise<{ exceeded: boolean; text?: string; stream?: ReadableStream<Uint8Array> }> {
+  if (!res.body) return { exceeded: false, text: '' };
+  const reader = res.body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      total += value.byteLength;
+      if (total > maxBytes) {
+        const passthrough = new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const ch of chunks) controller.enqueue(ch);
+          },
+          async pull(controller) {
+            const { done: d, value: v } = await reader.read();
+            if (d) controller.close();
+            else if (v) controller.enqueue(v);
+          },
+          cancel(reason) {
+            return reader.cancel(reason);
+          }
+        });
+        return { exceeded: true, stream: passthrough };
+      }
+    }
+  }
+
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const ch of chunks) {
+    combined.set(ch, offset);
+    offset += ch.byteLength;
+  }
+  return { exceeded: false, text: new TextDecoder().decode(combined) };
+}
+
+function isPrivateIpv4Octets(b0: number, b1: number, b2: number, b3: number): boolean {
+  if (b0 === 0) return true; // 0.0.0.0/8
+  if (b0 === 10) return true; // 10.0.0.0/8
+  if (b0 === 100 && b1 >= 64 && b1 <= 127) return true; // 100.64.0.0/10 carrier NAT
+  if (b0 === 127) return true; // 127.0.0.0/8 loopback
+  if (b0 === 169 && b1 === 254) return true; // 169.254.0.0/16 cloud metadata
+  if (b0 === 172 && b1 >= 16 && b1 <= 31) return true; // 172.16.0.0/12
+  if (b0 === 192 && b1 === 0 && b2 === 0) return true; // 192.0.0.0/24
+  if (b0 === 192 && b1 === 0 && b2 === 2) return true; // 192.0.2.0/24
+  if (b0 === 192 && b1 === 168) return true; // 192.168.0.0/16
+  if (b0 === 198 && (b1 === 18 || b1 === 19)) return true; // 198.18.0.0/15
+  if (b0 === 198 && b1 === 51 && b2 === 100) return true; // 198.51.100.0/24
+  if (b0 === 203 && b1 === 0 && b2 === 113) return true; // 203.0.113.0/24
+  if (b0 >= 224) return true; // multicast & reserved (incl. 255.255.255.255)
+  void b3;
+  return false;
+}
+
+function isValidIpv6(ip: string): boolean {
+  if (!ip || !ip.includes(':')) return false;
+  if (ip.includes(':::')) return false;
+  if ((ip.match(/::/g) || []).length > 1) return false;
+  const parts = ip.split(':');
+  if (parts.length < 3 || parts.length > 8) return false;
+  for (const part of parts) {
+    if (part.length > 4) return false;
+    if (part.length > 0 && !/^[0-9a-fA-F]+$/.test(part)) return false;
+  }
+  return true;
+}
+
 /**
  * Zero-Trust Second-Layer Guardrail:
  * Validates target host to prevent SSRF against loopback, cloud metadata, or private RFC1918 subnets.
@@ -482,7 +603,8 @@ export function isSafeTargetHost(rawHost: string): boolean {
       if (isNaN(port) || port < 1 || port > 65535) return false;
     }
     const ip = match[1];
-    return !isPrivateIp(ip);
+    if (isPrivateIp(ip)) return false;
+    return isValidIpv6(ip);
   }
 
   if (host.includes(':')) {
@@ -529,18 +651,20 @@ export function isSafeTargetHost(rawHost: string): boolean {
 
   // 5. Bare IPv6 address
   if (hostname.includes(':')) {
+    if (isPrivateIp(hostname)) return false;
+    return isValidIpv6(hostname);
+  }
+
+  // 6. IPv4 / numeric-like IP representations (standard, octal, hex, integer)
+  if (/^[0-9.]+$/.test(hostname) || /^0x[0-9a-f.]+$/i.test(hostname)) {
     return !isPrivateIp(hostname);
   }
 
-  // 6. IPv4 address
-  if (/^[0-9.]+$/.test(hostname)) {
-    return !isPrivateIp(hostname);
-  }
-
-  // 7. FQDN syntax (must have at least one dot to prevent internal machine names)
+  // 7. FQDN syntax (must have at least one dot; TLD must not be pure numeric or hex octet)
   if (!hostname.includes('.')) return false;
   const labels = hostname.split('.');
   if (labels.some(l => l.length === 0 || l.length > 63)) return false;
+  if (/^(\d+|0x[0-9a-f]+)$/i.test(labels[labels.length - 1])) return false;
   for (const label of labels) {
     if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(label)) return false;
   }
@@ -549,37 +673,69 @@ export function isSafeTargetHost(rawHost: string): boolean {
 }
 
 export function isPrivateIp(ip: string): boolean {
-  if (!ip) return true;
+  if (!ip || typeof ip !== 'string') return true;
+  let clean = ip.trim().toLowerCase();
+  if (clean.startsWith('[') && clean.endsWith(']')) {
+    clean = clean.slice(1, -1);
+  }
+
+  // IPv4-mapped IPv6 (dotted or hex form)
+  if (clean.startsWith('::ffff:')) {
+    const v4Part = clean.slice(7);
+    if (v4Part.includes('.')) {
+      return isPrivateIp(v4Part);
+    }
+    const hexParts = v4Part.split(':');
+    if (hexParts.length === 2) {
+      const p1 = parseInt(hexParts[0], 16);
+      const p2 = parseInt(hexParts[1], 16);
+      if (!isNaN(p1) && !isNaN(p2)) {
+        return isPrivateIpv4Octets((p1 >> 8) & 0xff, p1 & 0xff, (p2 >> 8) & 0xff, p2 & 0xff);
+      }
+    }
+    return true;
+  }
 
   // IPv6
-  if (ip.includes(':')) {
-    const clean = ip.toLowerCase();
-    if (clean === '::1' || clean === '::') return true;
-    if (clean.startsWith('fe80:') || clean.startsWith('fe8') || clean.startsWith('fe9') || clean.startsWith('fea') || clean.startsWith('feb')) return true; // fe80::/10
-    if (clean.startsWith('fc00:') || clean.startsWith('fd')) return true; // fc00::/7
-    if (clean.startsWith('::ffff:')) {
-      const v4 = clean.replace('::ffff:', '');
-      return isPrivateIp(v4);
-    }
+  if (clean.includes(':')) {
+    if (clean === '::1' || clean === '::' || clean === '0:0:0:0:0:0:0:0' || clean === '0:0:0:0:0:0:0:1') return true;
+    if (clean.startsWith('fe8') || clean.startsWith('fe9') || clean.startsWith('fea') || clean.startsWith('feb')) return true; // fe80::/10
+    if (clean.startsWith('fec') || clean.startsWith('fed') || clean.startsWith('fee') || clean.startsWith('fef')) return true; // fec0::/10
+    if (clean.startsWith('fc') || clean.startsWith('fd')) return true; // fc00::/7
+    if (clean.startsWith('ff')) return true; // ff00::/8 multicast
+    if (clean.startsWith('100:')) return true; // 100::/64 discard
+    if (clean.startsWith('2001:db8') || clean.startsWith('2001:0db8')) return true; // docs
     return false;
   }
 
-  // IPv4
-  const parts = ip.split('.');
-  if (parts.length !== 4) return true;
-  const nums = parts.map(Number);
-  if (nums.some(n => isNaN(n) || n < 0 || n > 255)) return true;
+  // Integer IPv4 representation (e.g. 2130706433)
+  if (/^\d+$/.test(clean)) {
+    const num = Number(clean);
+    if (!isNaN(num) && num >= 0 && num <= 0xffffffff) {
+      return isPrivateIpv4Octets((num >>> 24) & 255, (num >>> 16) & 255, (num >>> 8) & 255, num & 255);
+    }
+    return true;
+  }
 
-  const [b0, b1] = nums;
-  if (b0 === 0) return true; // 0.0.0.0/8
-  if (b0 === 10) return true; // 10.0.0.0/8
-  if (b0 === 127) return true; // 127.0.0.0/8 loopback
-  if (b0 === 169 && b1 === 254) return true; // 169.254.0.0/16
-  if (b0 === 172 && b1 >= 16 && b1 <= 31) return true; // 172.16.0.0/12
-  if (b0 === 192 && b1 === 168) return true; // 192.168.0.0/16
-  if (b0 === 100 && b1 >= 64 && b1 <= 127) return true; // 100.64.0.0/10 carrier NAT
-  if (b0 >= 224) return true; // 224.0.0.0/4 multicast & reserved
-  return false;
+  // Standard, octal (0177), or hex (0x7f) IPv4 octets
+  const rawParts = clean.split('.');
+  if (rawParts.length !== 4) return true;
+
+  const parts: number[] = [];
+  for (const part of rawParts) {
+    let val: number;
+    if (part.startsWith('0x')) {
+      val = parseInt(part, 16);
+    } else if (part.length > 1 && part.startsWith('0')) {
+      val = parseInt(part, 8);
+    } else {
+      val = Number(part);
+    }
+    if (isNaN(val) || val < 0 || val > 255) return true;
+    parts.push(val);
+  }
+
+  return isPrivateIpv4Octets(parts[0], parts[1], parts[2], parts[3]);
 }
 
 export default app
