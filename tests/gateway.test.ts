@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import app, { isSafeTargetHost, isPrivateIp } from '../src/index';
+import app, { isSafeTargetHost, isPrivateIp, sanitizeTargetUrl } from '../src/index';
 import { SignJWT } from 'jose';
 
 const TEST_SECRET = 'mock-test-secret-for-vitest-suite-only-hs256-signature-key-256bit';
@@ -186,5 +186,47 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, revokedDbEnv);
     expect(res.status).toBe(401);
     expect(await res.text()).toContain('Token has been revoked');
+  });
+
+  it('should sanitize sensitive query parameters in target URLs', () => {
+    expect(sanitizeTargetUrl('https://api.example.com/pay?token=secret123&user=john'))
+      .toBe('https://api.example.com/pay?token=%5BREDACTED%5D&user=john');
+    expect(sanitizeTargetUrl('https://api.example.com/v1?api_key=sk-123456&debug=true'))
+      .toBe('https://api.example.com/v1?api_key=%5BREDACTED%5D&debug=true');
+    expect(sanitizeTargetUrl('https://api.example.com/webhook?password=mypassword'))
+      .toBe('https://api.example.com/webhook?password=%5BREDACTED%5D');
+    expect(sanitizeTargetUrl('invalid-url?token=xyz'))
+      .toContain('[REDACTED]');
+  });
+
+  it('should execute asynchronous telemetry with structured fields into D1', async () => {
+    const executedQueries: string[] = [];
+    const boundArgs: any[][] = [];
+
+    const mockDb = {
+      prepare: (sql: string) => {
+        executedQueries.push(sql);
+        return {
+          bind: (...args: any[]) => {
+            boundArgs.push(args);
+            return {
+              run: async () => ({ success: true }),
+              first: async () => ({ jwtSalt: 0, isRevoked: 0 })
+            };
+          }
+        };
+      }
+    };
+
+    const token = await generateTestToken({ fault: '429', source: 'AGENT_API', tokenHint: 'cly12345...' });
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, {
+      AUTH_SECRET: TEST_SECRET,
+      DB: mockDb as any
+    });
+    expect(res.status).toBe(429);
+    
+    // Verify that D1 statements were prepared (Token update, ChaosLog insert, Usage upsert)
+    expect(executedQueries.some(q => q.includes('INSERT INTO ChaosLog'))).toBe(true);
+    expect(executedQueries.some(q => q.includes('UPDATE Token SET lastUsedAt'))).toBe(true);
   });
 });

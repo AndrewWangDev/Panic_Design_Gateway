@@ -144,7 +144,7 @@ app.all('*', async (c) => {
 
     if (!failOpenMode) {
       if (fault === '502') {
-      logTelemetryAsync(c, payload, 0);
+      logTelemetryAsync(c, payload, { statusCode: 502, latencyAdded: 0, rayId, edgeColo: currentColo });
       return new Response(JSON.stringify({
         error: {
           code: "bad_gateway",
@@ -162,7 +162,7 @@ app.all('*', async (c) => {
     }
     if (fault === '504') {
       await new Promise(r => setTimeout(r, 2000));
-      logTelemetryAsync(c, payload, 2000);
+      logTelemetryAsync(c, payload, { statusCode: 504, latencyAdded: 2000, rayId, edgeColo: currentColo });
       return new Response(JSON.stringify({
         error: {
           code: "gateway_timeout",
@@ -179,7 +179,7 @@ app.all('*', async (c) => {
       });
     }
     if (fault === '429') {
-      logTelemetryAsync(c, payload, 0);
+      logTelemetryAsync(c, payload, { statusCode: 429, latencyAdded: 0, rayId, edgeColo: currentColo });
       return new Response(JSON.stringify({
         error: {
           code: "rate_limit_exceeded",
@@ -207,7 +207,7 @@ app.all('*', async (c) => {
       }
       
       if (shouldDrop) {
-        logTelemetryAsync(c, payload, 0);
+        logTelemetryAsync(c, payload, { statusCode: 444, latencyAdded: 0, rayId, edgeColo: currentColo });
         return new Response('', {
           status: 444,
           statusText: 'No Response',
@@ -309,7 +309,7 @@ app.all('*', async (c) => {
 
     // Start telemetry async without blocking the proxy response
     try {
-      logTelemetryAsync(c, payload, finalDelay, url.toString());
+      logTelemetryAsync(c, payload, { targetUrl: url.toString(), latencyAdded: finalDelay, rayId, edgeColo: currentColo });
     } catch(e: any) {
       console.error('Telemetry synchronous error:', e);
     }
@@ -424,38 +424,87 @@ app.all('*', async (c) => {
   }
 })
 
-// Asynchronous Logging
-function logTelemetryAsync(c: any, payload: any, latencyAdded: number, targetUrl: string = '') {
+export function sanitizeTargetUrl(rawUrl: string): string {
+  if (!rawUrl) return '';
+  try {
+    const parsed = new URL(rawUrl);
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (/^(token|chaos_token|auth|key|secret|password|bearer|api_key)$/i.test(key)) {
+        parsed.searchParams.set(key, '[REDACTED]');
+      }
+    }
+    return parsed.toString();
+  } catch {
+    return rawUrl.replace(/([?&](?:token|chaos_token|auth|key|secret|password)=)[^&#\s]*/gi, '$1[REDACTED]');
+  }
+}
+
+interface TelemetryOptions {
+  latencyAdded?: number;
+  targetUrl?: string;
+  statusCode?: number;
+  rayId?: string;
+  edgeColo?: string;
+}
+
+// Asynchronous Logging with backward-compatible schema fallback
+function logTelemetryAsync(c: any, payload: any, options: TelemetryOptions = {}) {
   if (!c.env.DB) return;
   const userId = payload.userId;
   const tokenId = payload.tokenId;
   const fault = payload.fault;
+  const source = payload.source || 'DIRECT_DATA_PLANE';
+  const tokenHint = typeof payload.tokenHint === 'string' 
+    ? payload.tokenHint 
+    : (tokenId ? `${String(tokenId).slice(0, 8)}...` : null);
   
+  const latencyAdded = options.latencyAdded ?? 0;
+  const targetUrl = sanitizeTargetUrl(options.targetUrl || (payload.targetHost ? `https://${payload.targetHost}` : ''));
+  const statusCode = options.statusCode ?? (fault === '502' ? 502 : fault === '504' ? 504 : fault === '429' ? 429 : 200);
+  const rayId = options.rayId || c.req.header('cf-ray') || 'unknown';
+  const edgeColo = options.edgeColo || (c.req.raw.cf?.colo as string) || 'UNKNOWN';
+
   const now = new Date();
   const monthStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
   const isoTime = now.toISOString();
 
-  c.executionCtx.waitUntil(
-    Promise.all([
-      // Update Token last used
-      c.env.DB.prepare('UPDATE Token SET lastUsedAt = ? WHERE id = ?')
-        .bind(isoTime, tokenId)
-        .run(),
-        
-      // Insert Chaos Log
-      c.env.DB.prepare('INSERT INTO ChaosLog (id, userId, targetUrl, injectedFault, executedAt) VALUES (?, ?, ?, ?, ?)')
+  const telemetryPromise = Promise.all([
+    // Update Token last used
+    c.env.DB.prepare('UPDATE Token SET lastUsedAt = ? WHERE id = ?')
+      .bind(isoTime, tokenId)
+      .run(),
+      
+    // Insert Chaos Log with structured fields (falls back to legacy 5-param insert if table not yet migrated)
+    c.env.DB.prepare(`
+      INSERT INTO ChaosLog (
+        id, userId, targetUrl, injectedFault, executedAt,
+        source, tokenId, tokenHint, edgeColo, statusCode, latencyMs, rayId
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(), userId, targetUrl, fault, isoTime,
+      source, tokenId, tokenHint, edgeColo, statusCode, latencyAdded, rayId
+    ).run().catch((_insertErr: any) => {
+      return c.env.DB.prepare('INSERT INTO ChaosLog (id, userId, targetUrl, injectedFault, executedAt) VALUES (?, ?, ?, ?, ?)')
         .bind(crypto.randomUUID(), userId, targetUrl, fault, isoTime)
-        .run(),
-        
-      // Upsert Usage (D1 supports ON CONFLICT for SQLite)
-      c.env.DB.prepare(`
-        INSERT INTO Usage (id, userId, month, requestCount, "limit") 
-        VALUES (?, ?, ?, 1, 10000)
-        ON CONFLICT(userId, month) DO UPDATE SET requestCount = requestCount + 1
-      `).bind(crypto.randomUUID(), userId, monthStr)
-        .run()
-    ]).catch(err => console.error('Panic Gateway Telemetry Error:', err))
-  );
+        .run();
+    }),
+      
+    // Upsert Usage (D1 supports ON CONFLICT for SQLite)
+    c.env.DB.prepare(`
+      INSERT INTO Usage (id, userId, month, requestCount, "limit") 
+      VALUES (?, ?, ?, 1, 10000)
+      ON CONFLICT(userId, month) DO UPDATE SET requestCount = requestCount + 1
+    `).bind(crypto.randomUUID(), userId, monthStr)
+      .run()
+  ]).catch((err: any) => console.error('Panic Gateway Telemetry Error:', err));
+
+  try {
+    if (c.executionCtx?.waitUntil) {
+      c.executionCtx.waitUntil(telemetryPromise);
+    }
+  } catch {
+    // Vitest/mock runner without Worker ExecutionContext
+  }
 }
 
 function getColoCoordinates(colo: string): string {
