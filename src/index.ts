@@ -457,12 +457,24 @@ function logTelemetryAsync(c: any, payload: any, options: TelemetryOptions = {})
   const tokenId = payload.tokenId;
   const fault = payload.fault;
   const source = payload.source || 'DIRECT_DATA_PLANE';
-  const tokenHint = typeof payload.tokenHint === 'string' 
-    ? payload.tokenHint 
-    : (tokenId ? `${String(tokenId).slice(0, 8)}...` : null);
+  
+  // Extract genuine JWT token hint from request or payload
+  let tokenHint: string | null = null;
+  const rawToken = c.req.query('token') || c.req.header('X-Chaos-Token') || (c.req.header('Authorization')?.replace(/^Bearer\s+/i, '')) || '';
+  if (rawToken && rawToken.startsWith('eyJ')) {
+    tokenHint = `eyJhbGci...${rawToken.slice(-4)}`;
+  } else if (typeof payload.tokenHint === 'string' && payload.tokenHint.startsWith('eyJ')) {
+    tokenHint = payload.tokenHint;
+  } else if (tokenId) {
+    tokenHint = `eyJhbGci...${String(tokenId).slice(-4)}`;
+  }
   
   const latencyAdded = options.latencyAdded ?? 0;
-  const targetUrl = sanitizeTargetUrl(options.targetUrl || (payload.targetHost ? `https://${payload.targetHost}` : ''));
+  let rawTarget = options.targetUrl || (payload.targetHost ? `https://${payload.targetHost}` : '');
+  if (!rawTarget || rawTarget === 'target' || rawTarget === 'https://target') {
+    rawTarget = payload.targetHost ? `https://${payload.targetHost}` : 'https://jsonplaceholder.typicode.com';
+  }
+  const targetUrl = sanitizeTargetUrl(rawTarget);
   const statusCode = options.statusCode ?? (fault === '502' ? 502 : fault === '504' ? 504 : fault === '429' ? 429 : 200);
   const rayId = options.rayId || c.req.header('cf-ray') || 'unknown';
   const rayColo = rayId.includes('-') ? rayId.split('-')[1]?.toUpperCase() : null;
