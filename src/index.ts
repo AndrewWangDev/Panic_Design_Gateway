@@ -2,7 +2,8 @@ import { Hono } from 'hono'
 import { jwtVerify } from 'jose'
 
 type Bindings = {
-  AUTH_SECRET: string
+  AUTH_SECRET?: string
+  CHAOS_JWT_SECRET?: string
   DB: D1Database
 }
 
@@ -11,7 +12,8 @@ const app = new Hono<{ Bindings: Bindings }>()
 app.all('*', async (c) => {
   try {
     const authHeader = c.req.header('Authorization')
-    let token = c.req.query('token')
+    const chaosHeader = c.req.header('X-Chaos-Token') || c.req.header('x-chaos-token')
+    let token = chaosHeader || c.req.query('token')
 
     if (!token && authHeader && authHeader.startsWith('Bearer ')) {
       token = authHeader.split(' ')[1]
@@ -23,12 +25,13 @@ app.all('*', async (c) => {
 
     let payload: any;
     try {
-      if (!c.env.AUTH_SECRET) {
+      const jwtSecret = c.env.CHAOS_JWT_SECRET || c.env.AUTH_SECRET;
+      if (!jwtSecret) {
         return c.text('Panic Gateway: AUTH_SECRET not configured', 500)
       }
 
       // Step 1: Pure in-memory decryption and signature verification (< 1ms)
-      const secret = new TextEncoder().encode(c.env.AUTH_SECRET)
+      const secret = new TextEncoder().encode(jwtSecret)
       const result = await jwtVerify(token, secret)
       payload = result.payload;
     } catch (err) {
@@ -199,6 +202,14 @@ app.all('*', async (c) => {
         headers: Object.assign({ 'Content-Type': 'application/json' }, buildHeaders(0, 0)) 
       });
     }
+    if (fault === '444') {
+      logTelemetryAsync(c, payload, { statusCode: 444, latencyAdded: 0, rayId, edgeColo: currentColo });
+      return new Response('', {
+        status: 444,
+        statusText: 'No Response',
+        headers: buildHeaders(0, 0)
+      });
+    }
     if (fault === 'latency') {
       const dropRate = Number(payload.packetLoss) || Number(payload.chaosPolicy?.packetLoss) || 0;
       let shouldDrop = false;
@@ -294,6 +305,10 @@ app.all('*', async (c) => {
     stripHopByHopHeaders(headers)
     headers.set('Host', targetHost)
 
+    // Strip chaos headers to prevent leaking credentials to upstream service
+    headers.delete('x-chaos-token')
+    headers.delete('X-Chaos-Token')
+
     // Strip incoming chaos Authorization header if it matched our token
     const incomingAuth = headers.get('Authorization')
     if (incomingAuth && incomingAuth === `Bearer ${token}`) {
@@ -303,6 +318,12 @@ app.all('*', async (c) => {
       headers.delete('content-length')
     }
 
+    const mutilation = payload.mutilationStrategy || 'None';
+    if (!failOpenMode && fault === 'latency' && mutilation !== 'None') {
+      // Force upstream to return uncompressed identity stream so text mutilation doesn't corrupt compressed binary gzip/br
+      headers.set('accept-encoding', 'identity');
+    }
+
     const newReq = new Request(url.toString(), {
       method: c.req.method,
       headers: headers,
@@ -310,22 +331,27 @@ app.all('*', async (c) => {
       redirect: 'manual'
     })
 
-    // Start telemetry async without blocking the proxy response
-    try {
-      logTelemetryAsync(c, payload, { targetUrl: url.toString(), latencyAdded: finalDelay, rayId, edgeColo: currentColo });
-    } catch(e: any) {
-      console.error('Telemetry synchronous error:', e);
-    }
-
     try {
       const startT3 = Date.now();
       const response = await fetch(newReq);
       const t3 = Date.now() - startT3;
 
+      // Start telemetry async with authentic upstream response status
+      try {
+        logTelemetryAsync(c, payload, {
+          targetUrl: url.toString(),
+          latencyAdded: finalDelay,
+          statusCode: response.status,
+          rayId,
+          edgeColo: currentColo
+        });
+      } catch (e: any) {
+        console.error('Telemetry synchronous error:', e);
+      }
+
       let resBody: any = response.body;
       const newHeaders = new Headers(response.headers);
       stripHopByHopHeaders(newHeaders);
-      const mutilation = payload.mutilationStrategy || 'None';
       const MAX_MUTILATION_BYTES = 2 * 1024 * 1024; // 2MB Worker memory safety cap
 
       if (!failOpenMode && fault === 'latency' && mutilation !== 'None') {
@@ -406,6 +432,17 @@ app.all('*', async (c) => {
       return newRes;
     } catch (err: any) {
       console.error('Panic Gateway Proxy Origin Error:', err);
+      try {
+        logTelemetryAsync(c, payload, {
+          targetUrl: url.toString(),
+          latencyAdded: finalDelay,
+          statusCode: 502,
+          rayId,
+          edgeColo: currentColo
+        });
+      } catch (e: any) {
+        console.error('Telemetry synchronous error:', e);
+      }
       return new Response(JSON.stringify({
         error: {
           code: "bad_gateway",

@@ -229,4 +229,29 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     expect(executedQueries.some(q => q.includes('INSERT INTO ChaosLog'))).toBe(true);
     expect(executedQueries.some(q => q.includes('UPDATE Token SET lastUsedAt'))).toBe(true);
   });
+
+  it('should authenticate via X-Chaos-Token header', async () => {
+    const token = await generateTestToken({ fault: '429' });
+    const res = await app.request('https://gateway.andrewwangdev.com/', {
+      headers: { 'X-Chaos-Token': token }
+    }, mockEnv);
+    expect(res.status).toBe(429);
+  });
+
+  it('should inject 444 No Response when fault is 444', async () => {
+    const token = await generateTestToken({ fault: '444' });
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+    expect(res.status).toBe(444);
+    expect(await res.text()).toBe('');
+  });
+
+  it('should authenticate with CHAOS_JWT_SECRET when configured', async () => {
+    const customSecret = 'custom-chaos-secret-key-1234567890-test';
+    const customToken = await generateTestToken({ fault: '429' }, customSecret);
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${customToken}`, {}, {
+      CHAOS_JWT_SECRET: customSecret,
+      DB: null as any
+    });
+    expect(res.status).toBe(429);
+  });
 });
