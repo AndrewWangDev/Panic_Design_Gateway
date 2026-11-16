@@ -122,7 +122,9 @@ app.all('*', async (c) => {
     let finalDelay = 0;
     // Helper to build headers early for aborts
     const buildHeaders = (t2: number, t3: number) => {
-      const colo = (c.req.raw.cf?.colo as string) || 'UNKNOWN';
+      const rayHeader = c.req.header('cf-ray') || '';
+      const rayColo = rayHeader.includes('-') ? rayHeader.split('-')[1]?.toUpperCase() : null;
+      const colo = (c.req.raw.cf?.colo as string) || rayColo || 'EDGE';
       const w1 = getColoCoordinates(colo); // Already a string
       let w3Str = '0,0';
       if (payload.w3 && Array.isArray(payload.w3)) {
@@ -140,7 +142,8 @@ app.all('*', async (c) => {
     };
 
     const rayId = c.req.header('cf-ray') || 'unknown';
-    const currentColo = (c.req.raw.cf?.colo as string) || 'UNKNOWN';
+    const rayColo = rayId.includes('-') ? rayId.split('-')[1]?.toUpperCase() : null;
+    const currentColo = (c.req.raw.cf?.colo as string) || rayColo || 'EDGE';
 
     if (!failOpenMode) {
       if (fault === '502') {
@@ -462,7 +465,8 @@ function logTelemetryAsync(c: any, payload: any, options: TelemetryOptions = {})
   const targetUrl = sanitizeTargetUrl(options.targetUrl || (payload.targetHost ? `https://${payload.targetHost}` : ''));
   const statusCode = options.statusCode ?? (fault === '502' ? 502 : fault === '504' ? 504 : fault === '429' ? 429 : 200);
   const rayId = options.rayId || c.req.header('cf-ray') || 'unknown';
-  const edgeColo = options.edgeColo || (c.req.raw.cf?.colo as string) || 'UNKNOWN';
+  const rayColo = rayId.includes('-') ? rayId.split('-')[1]?.toUpperCase() : null;
+  const edgeColo = options.edgeColo || (c.req.raw.cf?.colo as string) || rayColo || 'EDGE';
 
   const now = new Date();
   const monthStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
