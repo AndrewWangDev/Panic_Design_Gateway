@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { cors } from 'hono/cors'
 import { jwtVerify } from 'jose'
 
 type Bindings = {
@@ -7,7 +8,28 @@ type Bindings = {
   DB: D1Database
 }
 
+// In-memory micro-cache for revocation status to protect D1 from write/read lock saturation
+type RevocationCacheEntry = {
+  jwtSalt: number
+  isRevoked: number
+  cachedAt: number
+}
+const REVOCATION_CACHE_TTL_MS = 5000;
+const revocationCache = new Map<string, RevocationCacheEntry>();
+
+export function _clearRevocationCache() {
+  revocationCache.clear();
+}
+
 const app = new Hono<{ Bindings: Bindings }>()
+
+// Zero-Trust CORS Support for Browser SPAs & Web UI Interceptor
+app.use('*', cors({
+  origin: (origin) => origin || '*',
+  allowHeaders: ['Authorization', 'X-Chaos-Token', 'x-chaos-token', 'Content-Type', 'Accept', 'X-Requested-With'],
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
+  maxAge: 86400
+}))
 
 app.all('*', async (c) => {
   try {
@@ -15,8 +37,8 @@ app.all('*', async (c) => {
     const chaosHeader = c.req.header('X-Chaos-Token') || c.req.header('x-chaos-token')
     let token = chaosHeader || c.req.query('token')
 
-    if (!token && authHeader && authHeader.startsWith('Bearer ')) {
-      token = authHeader.split(' ')[1]
+    if (!token && authHeader && /^Bearer\s+/i.test(authHeader)) {
+      token = authHeader.replace(/^Bearer\s+/i, '').trim()
     }
 
     if (!token) {
@@ -57,25 +79,45 @@ app.all('*', async (c) => {
     }
 
     if (c.env.DB) {
-      // Check revocation and salt
-      try {
-        const stmt = c.env.DB.prepare(`
-          SELECT u.jwtSalt, t.isRevoked 
-          FROM User u 
-          JOIN Token t ON u.id = t.userId 
-          WHERE t.id = ? AND u.id = ?
-        `).bind(tokenId, userId);
-        const row = await stmt.first<{ jwtSalt: number, isRevoked: number }>();
-        
-        if (!row) {
-          return c.text('Panic Gateway: Token or User not found', 401)
+      // Check revocation and salt with micro-cache
+      const cacheKey = `${userId}:${tokenId}`;
+      const cached = revocationCache.get(cacheKey);
+      const nowMs = Date.now();
+      let row: { jwtSalt: number; isRevoked: number } | null = null;
+
+      if (cached && (nowMs - cached.cachedAt) < REVOCATION_CACHE_TTL_MS) {
+        row = { jwtSalt: cached.jwtSalt, isRevoked: cached.isRevoked };
+      } else {
+        try {
+          const stmt = c.env.DB.prepare(`
+            SELECT u.jwtSalt, t.isRevoked 
+            FROM User u 
+            JOIN Token t ON u.id = t.userId 
+            WHERE t.id = ? AND u.id = ?
+          `).bind(tokenId, userId);
+          row = await stmt.first<{ jwtSalt: number, isRevoked: number }>();
+          if (row) {
+            revocationCache.set(cacheKey, {
+              jwtSalt: row.jwtSalt,
+              isRevoked: row.isRevoked,
+              cachedAt: nowMs
+            });
+            if (revocationCache.size > 1000) {
+              const firstKey = revocationCache.keys().next().value;
+              if (firstKey) revocationCache.delete(firstKey);
+            }
+          }
+        } catch (dbErr) {
+          console.error('Panic Gateway DB Check Error:', dbErr);
+          return c.text('Panic Gateway: Revocation check unavailable', 503);
         }
-        if (row.isRevoked === 1 || (issuedWithSalt !== undefined && row.jwtSalt !== issuedWithSalt)) {
-          return c.text('Panic Gateway: Token has been revoked', 401)
-        }
-      } catch (dbErr) {
-        console.error('Panic Gateway DB Check Error:', dbErr);
-        return c.text('Panic Gateway: Revocation check unavailable', 503);
+      }
+
+      if (!row) {
+        return c.text('Panic Gateway: Token or User not found', 401)
+      }
+      if (row.isRevoked === 1 || (issuedWithSalt !== undefined && row.jwtSalt !== issuedWithSalt)) {
+        return c.text('Panic Gateway: Token has been revoked', 401)
       }
     }
 
@@ -343,7 +385,8 @@ app.all('*', async (c) => {
           latencyAdded: finalDelay,
           statusCode: response.status,
           rayId,
-          edgeColo: currentColo
+          edgeColo: currentColo,
+          isFailOpen: failOpenMode
         });
       } catch (e: any) {
         console.error('Telemetry synchronous error:', e);
@@ -360,6 +403,7 @@ app.all('*', async (c) => {
           newHeaders.delete('content-length');
           newHeaders.delete('content-encoding');
           newHeaders.set('content-type', 'application/json');
+          newHeaders.set('X-Chaos-Mutilated', 'Empty Shell');
           resBody = JSON.stringify({
             data: null,
             items: [],
@@ -381,9 +425,11 @@ app.all('*', async (c) => {
               newHeaders.delete('content-encoding');
 
               if (mutilation === 'Unexpected EOF') {
+                newHeaders.set('X-Chaos-Mutilated', 'Unexpected EOF');
                 const cutIndex = Math.floor(rawText.length * 0.7);
                 resBody = rawText.substring(0, cutIndex) + '\n\n... [ERR_TCP_RESET: CONNECTION_DROPPED_BY_PEER]';
               } else if (mutilation === 'Type Poisoning') {
+                newHeaders.set('X-Chaos-Mutilated', 'Type Poisoning');
                 try {
                   const ast = JSON.parse(rawText);
                   const poison = (obj: any) => {
@@ -469,13 +515,13 @@ export function sanitizeTargetUrl(rawUrl: string): string {
   try {
     const parsed = new URL(rawUrl);
     for (const key of Array.from(parsed.searchParams.keys())) {
-      if (/^(token|chaos_token|auth|key|secret|password|bearer|api_key)$/i.test(key)) {
+      if (/(token|key|secret|pass|auth|cred|sign|bearer)/i.test(key)) {
         parsed.searchParams.set(key, '[REDACTED]');
       }
     }
     return parsed.toString();
   } catch {
-    return rawUrl.replace(/([?&](?:token|chaos_token|auth|key|secret|password)=)[^&#\s]*/gi, '$1[REDACTED]');
+    return rawUrl.replace(/([?&](?:[^=&#\s]*(?:token|key|secret|pass|auth|cred|sign|bearer)[^=&#\s]*)=)[^&#\s]*/gi, '$1[REDACTED]');
   }
 }
 
@@ -485,6 +531,7 @@ interface TelemetryOptions {
   statusCode?: number;
   rayId?: string;
   edgeColo?: string;
+  isFailOpen?: boolean;
 }
 
 // Asynchronous Logging with backward-compatible schema fallback
@@ -492,7 +539,7 @@ function logTelemetryAsync(c: any, payload: any, options: TelemetryOptions = {})
   if (!c.env.DB) return;
   const userId = payload.userId;
   const tokenId = payload.tokenId;
-  const fault = payload.fault;
+  const fault = options.isFailOpen ? 'PASSTHROUGH' : payload.fault;
   const source = payload.source || 'DIRECT_DATA_PLANE';
   
   // Extract genuine JWT token hint from request or payload
@@ -518,7 +565,6 @@ function logTelemetryAsync(c: any, payload: any, options: TelemetryOptions = {})
   const edgeColo = options.edgeColo || (c.req.raw.cf?.colo as string) || rayColo || 'EDGE';
 
   const now = new Date();
-  const monthStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
   const isoTime = now.toISOString();
 
   const telemetryPromise = Promise.all([
@@ -540,15 +586,7 @@ function logTelemetryAsync(c: any, payload: any, options: TelemetryOptions = {})
       return c.env.DB.prepare('INSERT INTO ChaosLog (id, userId, targetUrl, injectedFault, executedAt) VALUES (?, ?, ?, ?, ?)')
         .bind(crypto.randomUUID(), userId, targetUrl, fault, isoTime)
         .run();
-    }),
-      
-    // Upsert Usage (D1 supports ON CONFLICT for SQLite)
-    c.env.DB.prepare(`
-      INSERT INTO Usage (id, userId, month, requestCount, "limit") 
-      VALUES (?, ?, ?, 1, 10000)
-      ON CONFLICT(userId, month) DO UPDATE SET requestCount = requestCount + 1
-    `).bind(crypto.randomUUID(), userId, monthStr)
-      .run()
+    })
   ]).catch((err: any) => console.error('Panic Gateway Telemetry Error:', err));
 
   try {

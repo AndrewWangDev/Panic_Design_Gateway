@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import app, { isSafeTargetHost, isPrivateIp, sanitizeTargetUrl } from '../src/index';
+import app, { isSafeTargetHost, isPrivateIp, sanitizeTargetUrl, _clearRevocationCache } from '../src/index';
 import { SignJWT } from 'jose';
 
 const TEST_SECRET = 'mock-test-secret-for-vitest-suite-only-hs256-signature-key-256bit';
@@ -87,6 +87,11 @@ describe('Data Plane: Target Host & SSRF Guardrails', () => {
 });
 
 describe('Data Plane: Gateway Ingress & Fault Engine', () => {
+  beforeEach(() => {
+    _clearRevocationCache();
+    vi.clearAllMocks();
+  });
+
   const mockEnv = {
     AUTH_SECRET: TEST_SECRET,
     DB: null as any // Optional in mock testing
@@ -253,5 +258,65 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
       DB: null as any
     });
     expect(res.status).toBe(429);
+  });
+
+  it('should support CORS preflight OPTIONS request with allow headers', async () => {
+    const res = await app.request('https://gateway.andrewwangdev.com/test', {
+      method: 'OPTIONS',
+      headers: {
+        'Origin': 'https://panic.andrewwangdev.com',
+        'Access-Control-Request-Method': 'GET',
+        'Access-Control-Request-Headers': 'X-Chaos-Token, Authorization'
+      }
+    }, mockEnv);
+    expect(res.status).toBe(204);
+    expect(res.headers.get('access-control-allow-origin')).toBe('https://panic.andrewwangdev.com');
+    expect(res.headers.get('access-control-allow-methods')).toContain('GET');
+  });
+
+  it('should authenticate with case-insensitive lowercase bearer authorization header', async () => {
+    const token = await generateTestToken({ fault: '429' });
+    const res = await app.request('https://gateway.andrewwangdev.com/', {
+      headers: { 'authorization': `bearer ${token}` }
+    }, mockEnv);
+    expect(res.status).toBe(429);
+  });
+
+  it('should broadly sanitize access_token, client_secret, and sensitive credentials in target URL', () => {
+    const url = 'https://api.example.com/v1/user?access_token=secret123&client_secret=topsecret&api_key=mykey&normal=1';
+    const sanitized = sanitizeTargetUrl(url);
+    expect(sanitized).toContain('access_token=%5BREDACTED%5D');
+    expect(sanitized).toContain('client_secret=%5BREDACTED%5D');
+    expect(sanitized).toContain('api_key=%5BREDACTED%5D');
+    expect(sanitized).toContain('normal=1');
+  });
+
+  it('should leverage revocation micro-cache to prevent duplicate D1 queries within TTL', async () => {
+    let d1QueryCount = 0;
+    const trackingDbEnv = {
+      AUTH_SECRET: TEST_SECRET,
+      DB: {
+        prepare: () => ({
+          bind: () => ({
+            run: async () => ({ success: true }),
+            first: async () => {
+              d1QueryCount++;
+              return { jwtSalt: 0, isRevoked: 0 };
+            }
+          })
+        })
+      } as any
+    };
+
+    const token = await generateTestToken({ fault: '429', tokenId: 'token-cached-unique' });
+    // First request -> Cache Miss, queries D1
+    const res1 = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, trackingDbEnv);
+    expect(res1.status).toBe(429);
+    expect(d1QueryCount).toBe(1);
+
+    // Second request within 5s -> Cache Hit, does NOT query D1
+    const res2 = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, trackingDbEnv);
+    expect(res2.status).toBe(429);
+    expect(d1QueryCount).toBe(1);
   });
 });
