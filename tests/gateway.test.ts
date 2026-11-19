@@ -319,4 +319,55 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     expect(res2.status).toBe(429);
     expect(d1QueryCount).toBe(1);
   });
+
+  it('should clamp x-panic-t2 header to non-negative (>= 0) even when jitter > latency', async () => {
+    const mockEnv = {
+      AUTH_SECRET: TEST_SECRET,
+      DB: {
+        prepare: () => ({
+          bind: () => ({
+            run: async () => ({ success: true }),
+            first: async () => ({ jwtSalt: 0, isRevoked: 0 })
+          })
+        })
+      } as any
+    };
+
+    // Set large jitter and small base latency
+    const token = await generateTestToken({ fault: 'latency', latency: 10, jitter: 1000, distribution: 'Uniform' });
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+    const t2Header = res.headers.get('x-panic-t2');
+    expect(t2Header).toBeDefined();
+    const t2 = Number(t2Header);
+    expect(t2).toBeGreaterThanOrEqual(0);
+  });
+
+  it('should throttle Token.lastUsedAt updates to at most once per minute', async () => {
+    let updateTokenCount = 0;
+    const trackingDbEnv = {
+      AUTH_SECRET: TEST_SECRET,
+      DB: {
+        prepare: (sql: string) => ({
+          bind: () => ({
+            run: async () => {
+              if (sql.includes('UPDATE Token SET lastUsedAt')) {
+                updateTokenCount++;
+              }
+              return { success: true };
+            },
+            first: async () => ({ jwtSalt: 0, isRevoked: 0 })
+          })
+        })
+      } as any
+    };
+
+    const token = await generateTestToken({ fault: '429', tokenId: 'token-throttle-test' });
+    // First request -> updates Token.lastUsedAt
+    await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, trackingDbEnv);
+    expect(updateTokenCount).toBe(1);
+
+    // Second request within 60s -> skips Token.lastUsedAt update
+    await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, trackingDbEnv);
+    expect(updateTokenCount).toBe(1);
+  });
 });

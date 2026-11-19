@@ -17,8 +17,13 @@ type RevocationCacheEntry = {
 const REVOCATION_CACHE_TTL_MS = 5000;
 const revocationCache = new Map<string, RevocationCacheEntry>();
 
+// In-memory throttle for Token.lastUsedAt updates (at most once every 60s per token) to prevent D1 write lock saturation
+const LAST_USED_THROTTLE_MS = 60000;
+const lastUsedThrottleCache = new Map<string, number>();
+
 export function _clearRevocationCache() {
   revocationCache.clear();
+  lastUsedThrottleCache.clear();
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -54,7 +59,7 @@ app.all('*', async (c) => {
 
       // Step 1: Pure in-memory decryption and signature verification (< 1ms)
       const secret = new TextEncoder().encode(jwtSecret)
-      const result = await jwtVerify(token, secret)
+      const result = await jwtVerify(token, secret, { algorithms: ['HS256'] })
       payload = result.payload;
     } catch (err) {
       // Fails instantly if signature mismatch or expired TTL
@@ -304,10 +309,10 @@ app.all('*', async (c) => {
         }
       }
 
+      finalDelay = Math.max(0, Math.round(finalDelay));
+      if (finalDelay > 30000) finalDelay = 30000;
       if (finalDelay > 0) {
-        finalDelay = Math.round(finalDelay);
-        if (finalDelay > 30000) finalDelay = 30000;
-        await new Promise((resolve) => setTimeout(resolve, finalDelay))
+        await new Promise((resolve) => setTimeout(resolve, finalDelay));
       }
     }
     } // End if (!failOpenMode)
@@ -566,13 +571,13 @@ function logTelemetryAsync(c: any, payload: any, options: TelemetryOptions = {})
 
   const now = new Date();
   const isoTime = now.toISOString();
+  const nowTime = now.getTime();
 
-  const telemetryPromise = Promise.all([
-    // Update Token last used
-    c.env.DB.prepare('UPDATE Token SET lastUsedAt = ? WHERE id = ?')
-      .bind(isoTime, tokenId)
-      .run(),
-      
+  // In-memory throttle: only write UPDATE Token SET lastUsedAt to D1 if > 60s has elapsed for this token
+  const lastUpdate = lastUsedThrottleCache.get(tokenId) || 0;
+  const shouldUpdateLastUsed = (nowTime - lastUpdate) > LAST_USED_THROTTLE_MS;
+
+  const updatePromises: Promise<any>[] = [
     // Insert Chaos Log with structured fields (falls back to legacy 5-param insert if table not yet migrated)
     c.env.DB.prepare(`
       INSERT INTO ChaosLog (
@@ -587,7 +592,22 @@ function logTelemetryAsync(c: any, payload: any, options: TelemetryOptions = {})
         .bind(crypto.randomUUID(), userId, targetUrl, fault, isoTime)
         .run();
     })
-  ]).catch((err: any) => console.error('Panic Gateway Telemetry Error:', err));
+  ];
+
+  if (shouldUpdateLastUsed) {
+    lastUsedThrottleCache.set(tokenId, nowTime);
+    if (lastUsedThrottleCache.size > 1000) {
+      const oldestKey = lastUsedThrottleCache.keys().next().value;
+      if (oldestKey) lastUsedThrottleCache.delete(oldestKey);
+    }
+    updatePromises.push(
+      c.env.DB.prepare('UPDATE Token SET lastUsedAt = ? WHERE id = ?')
+        .bind(isoTime, tokenId)
+        .run()
+    );
+  }
+
+  const telemetryPromise = Promise.all(updatePromises).catch((err: any) => console.error('Panic Gateway Telemetry Error:', err));
 
   try {
     if (c.executionCtx?.waitUntil) {
