@@ -83,47 +83,49 @@ app.all('*', async (c) => {
       return c.text('Panic Gateway: Forbidden Target Host (SSRF Blocked)', 400)
     }
 
-    if (c.env.DB) {
-      // Check revocation and salt with micro-cache
-      const cacheKey = `${userId}:${tokenId}`;
-      const cached = revocationCache.get(cacheKey);
-      const nowMs = Date.now();
-      let row: { jwtSalt: number; isRevoked: number } | null = null;
+    if (!c.env.DB) {
+      return c.text('Panic Gateway: Database binding required', 500)
+    }
 
-      if (cached && (nowMs - cached.cachedAt) < REVOCATION_CACHE_TTL_MS) {
-        row = { jwtSalt: cached.jwtSalt, isRevoked: cached.isRevoked };
-      } else {
-        try {
-          const stmt = c.env.DB.prepare(`
-            SELECT u.jwtSalt, t.isRevoked 
-            FROM User u 
-            JOIN Token t ON u.id = t.userId 
-            WHERE t.id = ? AND u.id = ?
-          `).bind(tokenId, userId);
-          row = await stmt.first<{ jwtSalt: number, isRevoked: number }>();
-          if (row) {
-            revocationCache.set(cacheKey, {
-              jwtSalt: row.jwtSalt,
-              isRevoked: row.isRevoked,
-              cachedAt: nowMs
-            });
-            if (revocationCache.size > 1000) {
-              const firstKey = revocationCache.keys().next().value;
-              if (firstKey) revocationCache.delete(firstKey);
-            }
+    // Check revocation and salt with micro-cache
+    const cacheKey = `${userId}:${tokenId}`;
+    const cached = revocationCache.get(cacheKey);
+    const nowMs = Date.now();
+    let row: { jwtSalt: number; isRevoked: number } | null = null;
+
+    if (cached && (nowMs - cached.cachedAt) < REVOCATION_CACHE_TTL_MS) {
+      row = { jwtSalt: cached.jwtSalt, isRevoked: cached.isRevoked };
+    } else {
+      try {
+        const stmt = c.env.DB.prepare(`
+          SELECT u.jwtSalt, t.isRevoked 
+          FROM User u 
+          JOIN Token t ON u.id = t.userId 
+          WHERE t.id = ? AND u.id = ?
+        `).bind(tokenId, userId);
+        row = await stmt.first<{ jwtSalt: number, isRevoked: number }>();
+        if (row) {
+          revocationCache.set(cacheKey, {
+            jwtSalt: row.jwtSalt,
+            isRevoked: row.isRevoked,
+            cachedAt: nowMs
+          });
+          if (revocationCache.size > 1000) {
+            const firstKey = revocationCache.keys().next().value;
+            if (firstKey) revocationCache.delete(firstKey);
           }
-        } catch (dbErr) {
-          console.error('Panic Gateway DB Check Error:', dbErr);
-          return c.text('Panic Gateway: Revocation check unavailable', 503);
         }
+      } catch (dbErr) {
+        console.error('Panic Gateway DB Check Error:', dbErr);
+        return c.text('Panic Gateway: Revocation check unavailable', 503);
       }
+    }
 
-      if (!row) {
-        return c.text('Panic Gateway: Token or User not found', 401)
-      }
-      if (row.isRevoked === 1 || (issuedWithSalt !== undefined && row.jwtSalt !== issuedWithSalt)) {
-        return c.text('Panic Gateway: Token has been revoked', 401)
-      }
+    if (!row) {
+      return c.text('Panic Gateway: Token or User not found', 401)
+    }
+    if (row.isRevoked === 1 || (issuedWithSalt !== undefined && row.jwtSalt !== issuedWithSalt)) {
+      return c.text('Panic Gateway: Token has been revoked', 401)
     }
 
     // Step 3: Traffic Scope Evaluation & Inject Faults
@@ -356,9 +358,9 @@ app.all('*', async (c) => {
     headers.delete('x-chaos-token')
     headers.delete('X-Chaos-Token')
 
-    // Strip incoming chaos Authorization header if it matched our token
+    // Strip incoming chaos Authorization header if it matched our token (case-insensitive RFC 6750)
     const incomingAuth = headers.get('Authorization')
-    if (incomingAuth && incomingAuth === `Bearer ${token}`) {
+    if (incomingAuth && incomingAuth.replace(/^Bearer\s+/i, '').trim() === token) {
       headers.delete('Authorization')
     }
     if (['GET', 'HEAD'].includes(c.req.method)) {

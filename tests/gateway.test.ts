@@ -92,9 +92,18 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     vi.clearAllMocks();
   });
 
+  const defaultMockDb = {
+    prepare: () => ({
+      bind: () => ({
+        first: async () => ({ jwtSalt: 0, isRevoked: 0 }),
+        run: async () => ({ success: true })
+      })
+    })
+  };
+
   const mockEnv = {
     AUTH_SECRET: TEST_SECRET,
-    DB: null as any // Optional in mock testing
+    DB: defaultMockDb as any
   };
 
   it('should reject request when token is missing', async () => {
@@ -255,7 +264,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     const customToken = await generateTestToken({ fault: '429' }, customSecret);
     const res = await app.request(`https://gateway.andrewwangdev.com/?token=${customToken}`, {}, {
       CHAOS_JWT_SECRET: customSecret,
-      DB: null as any
+      DB: defaultMockDb as any
     });
     expect(res.status).toBe(429);
   });
@@ -369,5 +378,67 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     // Second request within 60s -> skips Token.lastUsedAt update
     await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, trackingDbEnv);
     expect(updateTokenCount).toBe(1);
+  });
+
+  it('should fail closed (500) when D1 database binding is missing', async () => {
+    const token = await generateTestToken({ fault: '429' });
+    const noDbEnv = {
+      AUTH_SECRET: TEST_SECRET,
+      DB: null as any
+    };
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, noDbEnv);
+    expect(res.status).toBe(500);
+    expect(await res.text()).toContain('Panic Gateway: Database binding required');
+  });
+
+  it('should strip Authorization header when Bearer token matches case-insensitively with variable spacing', async () => {
+    let capturedHeaders: Headers | null = null;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      capturedHeaders = req.headers;
+      return new Response('upstream ok', { status: 200 });
+    });
+
+    try {
+      const token = await generateTestToken({ fault: 'none' });
+      // Case 1: lowercase 'bearer' with multiple spaces
+      await app.request('https://gateway.andrewwangdev.com/', {
+        headers: {
+          'Authorization': `bearer   ${token}`,
+          'X-Custom-Header': 'keep-me'
+        }
+      }, mockEnv);
+
+      expect(capturedHeaders).toBeDefined();
+      expect((capturedHeaders as any)?.get('Authorization')).toBeNull();
+      expect((capturedHeaders as any)?.get('X-Custom-Header')).toBe('keep-me');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should preserve upstream Authorization header when using X-Chaos-Token', async () => {
+    let capturedHeaders: Headers | null = null;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      capturedHeaders = req.headers;
+      return new Response('upstream ok', { status: 200 });
+    });
+
+    try {
+      const token = await generateTestToken({ fault: 'none' });
+      await app.request('https://gateway.andrewwangdev.com/', {
+        headers: {
+          'X-Chaos-Token': token,
+          'Authorization': 'Bearer upstream-api-key-12345'
+        }
+      }, mockEnv);
+
+      expect(capturedHeaders).toBeDefined();
+      expect((capturedHeaders as any)?.get('Authorization')).toBe('Bearer upstream-api-key-12345');
+      expect((capturedHeaders as any)?.get('X-Chaos-Token')).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
