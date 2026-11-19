@@ -29,7 +29,7 @@ npm install
 ### 3. Configure D1 Database & Environment
 Copy the example configuration:
 ```bash
-cp wrangler.toml.example wrangler.toml
+cp wrangler.example.toml wrangler.toml
 ```
 
 Edit `wrangler.toml` with your Cloudflare D1 database ID:

@@ -22,6 +22,7 @@ node_modules/
 *.key
 gen.cjs
 wrangler.toml
+!wrangler.example.toml
 wrangler.toml.local_backup
 
 # logs

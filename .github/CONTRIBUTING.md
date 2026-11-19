@@ -49,7 +49,7 @@ npm install
 ### 2. Environment Configuration
 Copy the template configuration:
 ```bash
-cp wrangler.toml.example wrangler.toml
+cp wrangler.example.toml wrangler.toml
 ```
 Configure `.dev.vars` for local development:
 ```env
