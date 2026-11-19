@@ -441,4 +441,23 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it('should recognize extended North America PoPs (DFW, ATL, MIA) for Cross-Region scope', async () => {
+    const token = await generateTestToken({ scope: 'Cross-Region', fault: '429' });
+    // Non-NA client visiting DFW edge PoP -> should inject fault (not fail-open)
+    const req = new Request(`https://gateway.andrewwangdev.com/?token=${token}`, {
+      headers: {
+        'cf-ray': '8f1234567890-DFW'
+      }
+    });
+    // Mock cf object
+    Object.defineProperty(req, 'cf', {
+      value: { colo: 'DFW', continent: 'AS' },
+      writable: true
+    });
+
+    const res = await app.fetch(req, mockEnv);
+    expect(res.status).toBe(429);
+    expect(res.headers.get('x-panic-colo')).toBe('DFW');
+  });
 });

@@ -149,7 +149,11 @@ app.all('*', async (c) => {
           failOpenReason = 'Not a recognized Cellular network';
         }
       } else if (scope === 'Cross-Region') {
-        const isNorthAmericaEdge = ['LAX', 'SFO', 'SJC', 'SEA', 'IAD', 'EWR', 'ORD'].includes(colo);
+        const isNorthAmericaEdge = [
+          'LAX', 'SFO', 'SJC', 'SEA', 'IAD', 'EWR', 'ORD', 'DFW', 'ATL', 'MIA',
+          'DEN', 'PHX', 'BOS', 'YYZ', 'YVR', 'IAH', 'MSP', 'DTW', 'CLT', 'PHL',
+          'SLC', 'YUL', 'MEX'
+        ].includes(colo);
         const isClientNA = cf?.continent === 'NA';
         if (!(isNorthAmericaEdge && !isClientNA)) {
           failOpenMode = true;
