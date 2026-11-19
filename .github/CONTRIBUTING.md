@@ -54,7 +54,10 @@ cp wrangler.example.toml wrangler.toml
 Configure `.dev.vars` for local development:
 ```env
 AUTH_SECRET="your-32-byte-hex-random-secret"
+CHAOS_JWT_SECRET="your-32-byte-hex-random-secret"
 ```
+
+> **Critical**: `CHAOS_JWT_SECRET` (or `AUTH_SECRET` if `CHAOS_JWT_SECRET` is unset) is the shared symmetric HS256 secret used to verify Chaos Tokens. It must strictly match the secret used by the Control Plane (`panic_design`) to sign tokens.
 
 ### 3. Run Locally
 ```bash
