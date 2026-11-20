@@ -838,6 +838,49 @@ export function isSafeTargetHost(rawHost: string): boolean {
   return true;
 }
 
+export function parseIpv6Words(ip: string): number[] | null {
+  if (!ip || typeof ip !== 'string') return null;
+
+  let clean = ip.trim().toLowerCase();
+  if (clean.startsWith('[') && clean.endsWith(']')) {
+    clean = clean.slice(1, -1);
+  }
+
+  // Handle embedded IPv4 at the end (e.g. ::ffff:192.168.1.1 or 0:0:0:0:0:ffff:127.0.0.1)
+  const lastColon = clean.lastIndexOf(':');
+  if (lastColon !== -1 && clean.slice(lastColon + 1).includes('.')) {
+    const v4Part = clean.slice(lastColon + 1);
+    const v4Octets = v4Part.split('.');
+    if (v4Octets.length !== 4) return null;
+    const b = v4Octets.map(Number);
+    if (b.some(n => isNaN(n) || n < 0 || n > 255)) return null;
+    const word1 = (b[0] << 8) | b[1];
+    const word2 = (b[2] << 8) | b[3];
+    clean = `${clean.slice(0, lastColon)}:${word1.toString(16)}:${word2.toString(16)}`;
+  }
+
+  const doubleColonIdx = clean.indexOf('::');
+  if (doubleColonIdx !== -1) {
+    if (clean.indexOf('::', doubleColonIdx + 2) !== -1) return null; // Only one "::" allowed
+    const leftStr = clean.slice(0, doubleColonIdx);
+    const rightStr = clean.slice(doubleColonIdx + 2);
+    const leftWords = leftStr ? leftStr.split(':') : [];
+    const rightWords = rightStr ? rightStr.split(':') : [];
+    const missing = 8 - (leftWords.length + rightWords.length);
+    if (missing < 1) return null;
+    clean = [...leftWords, ...new Array(missing).fill('0'), ...rightWords].join(':');
+  }
+
+  const parts = clean.split(':');
+  if (parts.length !== 8) return null;
+  const words: number[] = [];
+  for (const p of parts) {
+    if (!/^[0-9a-f]{1,4}$/i.test(p)) return null;
+    words.push(parseInt(p, 16));
+  }
+  return words;
+}
+
 export function isPrivateIp(ip: string): boolean {
   if (!ip || typeof ip !== 'string') return true;
   let clean = ip.trim().toLowerCase();
@@ -845,32 +888,65 @@ export function isPrivateIp(ip: string): boolean {
     clean = clean.slice(1, -1);
   }
 
-  // IPv4-mapped IPv6 (dotted or hex form)
-  if (clean.startsWith('::ffff:')) {
-    const v4Part = clean.slice(7);
-    if (v4Part.includes('.')) {
-      return isPrivateIp(v4Part);
-    }
-    const hexParts = v4Part.split(':');
-    if (hexParts.length === 2) {
-      const p1 = parseInt(hexParts[0], 16);
-      const p2 = parseInt(hexParts[1], 16);
-      if (!isNaN(p1) && !isNaN(p2)) {
-        return isPrivateIpv4Octets((p1 >> 8) & 0xff, p1 & 0xff, (p2 >> 8) & 0xff, p2 & 0xff);
-      }
-    }
-    return true;
-  }
-
-  // IPv6
+  // IPv6 checks (handles full normalization)
   if (clean.includes(':')) {
-    if (clean === '::1' || clean === '::' || clean === '0:0:0:0:0:0:0:0' || clean === '0:0:0:0:0:0:0:1') return true;
-    if (clean.startsWith('fe8') || clean.startsWith('fe9') || clean.startsWith('fea') || clean.startsWith('feb')) return true; // fe80::/10
-    if (clean.startsWith('fec') || clean.startsWith('fed') || clean.startsWith('fee') || clean.startsWith('fef')) return true; // fec0::/10
-    if (clean.startsWith('fc') || clean.startsWith('fd')) return true; // fc00::/7
-    if (clean.startsWith('ff')) return true; // ff00::/8 multicast
-    if (clean.startsWith('100:')) return true; // 100::/64 discard
-    if (clean.startsWith('2001:db8') || clean.startsWith('2001:0db8')) return true; // docs
+    const words = parseIpv6Words(clean);
+    if (!words) return true; // Malformed IPv6, reject as unsafe
+
+    // 1. Unspecified address (::/128)
+    if (words.every(w => w === 0)) return true;
+
+    // 2. Loopback address (::1/128)
+    if (words.slice(0, 7).every(w => w === 0) && words[7] === 1) return true;
+
+    // 3. IPv4-mapped IPv6 (::ffff:0:0/96 or ::ffff:a.b.c.d)
+    if (words.slice(0, 5).every(w => w === 0) && words[5] === 0xffff) {
+      const b0 = (words[6] >> 8) & 0xff;
+      const b1 = words[6] & 0xff;
+      const b2 = (words[7] >> 8) & 0xff;
+      const b3 = words[7] & 0xff;
+      return isPrivateIpv4Octets(b0, b1, b2, b3);
+    }
+
+    // 4. IPv4-compatible IPv6 (::/96 - deprecated RFC 4291)
+    if (words.slice(0, 6).every(w => w === 0) && (words[6] !== 0 || words[7] > 1)) {
+      const b0 = (words[6] >> 8) & 0xff;
+      const b1 = words[6] & 0xff;
+      const b2 = (words[7] >> 8) & 0xff;
+      const b3 = words[7] & 0xff;
+      return isPrivateIpv4Octets(b0, b1, b2, b3);
+    }
+
+    // 5. Unique Local Addresses (ULA, fc00::/7 -> fc00..fdff)
+    if ((words[0] & 0xfe00) === 0xfc00) return true;
+
+    // 6. Link-Local Unicast (fe80::/10 -> fe80..febf)
+    if ((words[0] & 0xffc0) === 0xfe80) return true;
+
+    // 7. Site-Local (deprecated RFC 3879, fec0::/10 -> fec0..feff)
+    if ((words[0] & 0xffc0) === 0xfec0) return true;
+
+    // 8. Multicast (ff00::/8)
+    if ((words[0] & 0xff00) === 0xff00) return true;
+
+    // 9. Discard prefix (100::/64, RFC 6666)
+    if (words[0] === 0x100 && words[1] === 0 && words[2] === 0 && words[3] === 0) return true;
+
+    // 10. Documentation prefix (2001:db8::/32, RFC 3849)
+    if (words[0] === 0x2001 && words[1] === 0x0db8) return true;
+
+    // 11. Benchmarking (2001:2::/48, RFC 5180)
+    if (words[0] === 0x2001 && words[1] === 0x0002) return true;
+
+    // 12. 6to4 (2002::/16, RFC 3056)
+    if (words[0] === 0x2002) {
+      const b0 = (words[1] >> 8) & 0xff;
+      const b1 = words[1] & 0xff;
+      const b2 = (words[2] >> 8) & 0xff;
+      const b3 = words[2] & 0xff;
+      return isPrivateIpv4Octets(b0, b1, b2, b3);
+    }
+
     return false;
   }
 

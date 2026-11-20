@@ -460,4 +460,18 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     expect(res.status).toBe(429);
     expect(res.headers.get('x-panic-colo')).toBe('DFW');
   });
+
+  it('should reject uncompressed and heterogeneous IPv6 loopback targets (SSRF defense)', async () => {
+    expect(isPrivateIp('0000:0000:0000:0000:0000:0000:0000:0001')).toBe(true);
+    expect(isPrivateIp('[0000:0000:0000:0000:0000:0000:0000:0001]')).toBe(true);
+    expect(isPrivateIp('0:0:0:0:0:ffff:127.0.0.1')).toBe(true);
+    expect(isPrivateIp('0000:0000:0000:0000:0000:ffff:7f00:0001')).toBe(true);
+    expect(isSafeTargetHost('[0000:0000:0000:0000:0000:0000:0000:0001]')).toBe(false);
+
+    const token = await generateTestToken({ targetHost: '[0000:0000:0000:0000:0000:0000:0000:0001]' });
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+    expect(res.status).toBe(400);
+    const body = await res.text();
+    expect(body).toContain('Forbidden Target Host (SSRF Blocked)');
+  });
 });
