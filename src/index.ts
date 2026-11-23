@@ -8,7 +8,16 @@ type Bindings = {
   DB: D1Database
 }
 
-// In-memory micro-cache for revocation status to protect D1 from write/read lock saturation
+/**
+ * In-memory micro-cache for token revocation status and user jwtSalt.
+ *
+ * Architectural Invariant:
+ * To maintain sub-millisecond edge proxy forwarding and avoid saturating Cloudflare D1
+ * with synchronous database reads on every incoming packet, the gateway caches revocation
+ * state for up to 5,000ms. This trade-off balances strict real-time revocation guarantees
+ * with high-throughput edge performance. If D1 suffers transient lock contention, a
+ * 60-second stale-while-revalidate fallback maintains proxy uptime.
+ */
 type RevocationCacheEntry = {
   jwtSalt: number
   isRevoked: number
@@ -92,7 +101,7 @@ export async function checkDomainDnsSafety(hostname: string): Promise<boolean> {
             .map((a: any) => a.data);
         }
       } catch {
-        // Fallback
+        // Fall back to an empty record set if upstream DoH resolution encounters network errors or timeouts.
       }
       return [];
     };
@@ -450,7 +459,7 @@ app.all('*', async (c) => {
         await new Promise((resolve) => setTimeout(resolve, finalDelay));
       }
     }
-    } // End if (!failOpenMode)
+    }
 
     // Step 4: Proxy request
     let targetHostname = targetHost;
@@ -556,7 +565,7 @@ app.all('*', async (c) => {
           const isCompressed = contentEncoding && contentEncoding !== 'identity';
 
           if (isCompressed) {
-            // Compressed upstream payloads cannot be safely UTF-8 decoded without corruption (SEC-ISSUE-02)
+            // Compressed upstream payloads cannot be safely UTF-8 decoded without corruption.
             newHeaders.set('X-Chaos-Mutation-Skipped', 'Upstream compressed encoding not decodable');
             resBody = response.body;
           } else {
@@ -967,7 +976,7 @@ export function isSafeTargetHost(rawHost: string): boolean {
   ]);
   if (blockedExact.has(hostname)) return false;
 
-  // Block self-referencing service domains & worker-to-worker loop candidates (PD-AUDIT-01)
+  // Block self-referencing service domains and worker-to-worker routing loop candidates.
   const blockedSelfDomains = new Set([
     'gateway.andrewwangdev.com',
     'panic.andrewwangdev.com',

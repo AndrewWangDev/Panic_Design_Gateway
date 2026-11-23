@@ -1,6 +1,6 @@
 # Panic Design Gateway
 
-The ultra-low-latency, stateless Edge Proxy and Chaos Engineering data-plane for [Panic Design](https://panic.andrewwangdev.com).
+The ultra-low-latency, stateless Edge Proxy and Chaos Engineering Data Plane Gateway for [Panic Design](https://panic.andrewwangdev.com).
 
 Deployed on Cloudflare Workers using [Hono](https://hono.dev).
 
@@ -9,7 +9,7 @@ Deployed on Cloudflare Workers using [Hono](https://hono.dev).
 ## 🚀 Features
 
 - **Sub-millisecond verification**: In-memory cryptographically verified JWT Chaos Tokens.
-- **Dynamic Chaos Injection**: Latency, jitter, packet loss, HTTP status faults (500, 502, 504), and fail-open fallbacks.
+- **Dynamic Chaos Injection**: Latency, jitter, packet loss, HTTP status faults (502, 504, 429, 444), payload mutilation, and fail-open fallbacks.
 - **Zero-Intrusion Proxy**: Automatically strips sensitive internal Chaos Tokens (`?token=...` and `Authorization: Bearer <token>`) before forwarding traffic to upstream endpoints.
 - **Asynchronous Telemetry**: Non-blocking asynchronous logging of fault injection to Cloudflare D1.
 
