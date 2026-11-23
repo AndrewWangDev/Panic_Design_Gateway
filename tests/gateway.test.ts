@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import app, { isSafeTargetHost, isPrivateIp, sanitizeTargetUrl, _clearRevocationCache, checkDomainDnsSafety, checkTokenRateLimit, _getTelemetryThrottleCacheSize } from '../src/index';
+import app, { isSafeTargetHost, isPrivateIp, sanitizeTargetUrl, _clearRevocationCache, checkDomainDnsSafety, checkTokenRateLimit, _getTelemetryThrottleCacheSize, _getDnsCacheEntry } from '../src/index';
 import { SignJWT } from 'jose';
 
 const TEST_SECRET = 'mock-test-secret-for-vitest-suite-only-hs256-signature-key-256bit';
@@ -720,6 +720,61 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
       expect(res.headers.get('content-encoding')).toBe('gzip');
       const bodyBytes = new Uint8Array(await res.arrayBuffer());
       expect(bodyBytes).toEqual(fakeCompressedBytes);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should allow uncompressed bare public IPv6 targetHost without truncation or SSRF false-positive (PD-SEC-01)', async () => {
+    const originalFetch = globalThis.fetch;
+    const bareIpv6 = '2606:4700:4700:0:0:0:0:1111';
+    expect(isSafeTargetHost(bareIpv6)).toBe(true);
+
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      return new Response('proxied over ipv6', { status: 200 });
+    });
+
+    try {
+      const token = await generateTestToken({
+        targetHost: bareIpv6,
+        fault: 'latency',
+        latency: 0
+      });
+      const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('proxied over ipv6');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should not cache transient DoH timeouts or network errors as 60s negative cache (PD-RES-05)', async () => {
+    const originalFetch = globalThis.fetch;
+    _clearRevocationCache();
+
+    let attempts = 0;
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      attempts++;
+      if (attempts === 1) {
+        throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+      }
+      return new Response(JSON.stringify({
+        Status: 0,
+        Answer: [{ type: 1, data: '93.184.216.34' }]
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+
+    try {
+      const domain = 'transient-flaky-domain.com';
+      // Attempt 1: Fails with timeout error -> Fail-closed safe: false, but NOT cached
+      const safe1 = await checkDomainDnsSafety(domain);
+      expect(safe1).toBe(false);
+      expect(_getDnsCacheEntry(domain)).toBeUndefined();
+
+      // Attempt 2: Network recovered -> Immediately resolves to true without waiting 60s
+      const safe2 = await checkDomainDnsSafety(domain);
+      expect(safe2).toBe(true);
+      expect(_getDnsCacheEntry(domain)?.safe).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
     }

@@ -85,40 +85,52 @@ export async function checkDomainDnsSafety(hostname: string): Promise<boolean> {
   }
 
   let safe = false;
+  let hasNetworkError = false;
   try {
-    const queryDns = async (qtype: 'A' | 'AAAA'): Promise<string[]> => {
+    const queryDns = async (qtype: 'A' | 'AAAA'): Promise<{ ips: string[]; error: boolean }> => {
       try {
         const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${qtype}`, {
           headers: { accept: 'application/dns-json' },
           signal: AbortSignal.timeout(3000)
         });
-        if (!res.ok) return [];
+        if (!res.ok) return { ips: [], error: true };
         const data = await res.json() as any;
         if (data && data.Status === 0 && Array.isArray(data.Answer)) {
           const expectedType = qtype === 'A' ? 1 : 28;
-          return data.Answer
+          const ips = data.Answer
             .filter((a: any) => a.type === expectedType && typeof a.data === 'string')
             .map((a: any) => a.data);
+          return { ips, error: false };
         }
+        return { ips: [], error: false };
       } catch {
-        // Fall back to an empty record set if upstream DoH resolution encounters network errors or timeouts.
+        // Fall back to an empty record set on network errors or timeouts without polluting long-term negative cache
+        return { ips: [], error: true };
       }
-      return [];
     };
 
-    const [v4List, v6List] = await Promise.all([queryDns('A'), queryDns('AAAA')]);
-    const allIps = [...v4List, ...v6List];
+    const [v4Res, v6Res] = await Promise.all([queryDns('A'), queryDns('AAAA')]);
+    if (v4Res.error || v6Res.error) {
+      hasNetworkError = true;
+    }
+    const allIps = [...v4Res.ips, ...v6Res.ips];
     if (allIps.length > 0 && allIps.every(ip => !isPrivateIp(ip))) {
       safe = true;
     }
   } catch {
     safe = false;
+    hasNetworkError = true;
   }
 
-  dnsResolutionCache.set(domain, { safe, cachedAt: now });
-  if (dnsResolutionCache.size > 1000) {
-    const firstKey = dnsResolutionCache.keys().next().value;
-    if (firstKey) dnsResolutionCache.delete(firstKey);
+  // Only apply long-lived 60s cache if DNS resolution completed successfully without transient network faults.
+  // Transient network errors fail-closed (return false) but are NOT cached for 60s to prevent temporary 3s blips
+  // from locking out the target host for 1 minute.
+  if (!hasNetworkError) {
+    dnsResolutionCache.set(domain, { safe, cachedAt: now });
+    if (dnsResolutionCache.size > 1000) {
+      const firstKey = dnsResolutionCache.keys().next().value;
+      if (firstKey) dnsResolutionCache.delete(firstKey);
+    }
   }
   return safe;
 }
@@ -133,6 +145,10 @@ export function _clearRevocationCache() {
 
 export function _getTelemetryThrottleCacheSize(): number {
   return telemetryThrottleCache.size;
+}
+
+export function _getDnsCacheEntry(domain: string) {
+  return dnsResolutionCache.get(domain.toLowerCase().trim());
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -209,7 +225,7 @@ app.all('*', async (c) => {
     if (targetHost.startsWith('[')) {
       const m = targetHost.match(/^\[([0-9a-f:]+)\](?::(\d{1,5}))?$/);
       if (m) hostOnly = m[1];
-    } else if (targetHost.includes(':') && !targetHost.includes('::')) {
+    } else if (targetHost.includes(':') && !targetHost.includes('::') && targetHost.split(':').length === 2) {
       hostOnly = targetHost.split(':')[0];
     }
     if (!(await checkDomainDnsSafety(hostOnly))) {
