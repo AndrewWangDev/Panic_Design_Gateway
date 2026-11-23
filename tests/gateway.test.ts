@@ -635,4 +635,67 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     expect(_getTelemetryThrottleCacheSize()).toBeLessThanOrEqual(2000);
     expect(_getTelemetryThrottleCacheSize()).toBe(2000);
   });
+
+  it('should format Host header with brackets for bare IPv6 targets (SEC-ISSUE-01)', async () => {
+    const originalFetch = globalThis.fetch;
+    let capturedHostHeader: string | null = null;
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      const urlStr = typeof req === 'string' ? req : req.url;
+      if (urlStr.includes('cloudflare-dns.com/dns-query')) {
+        return new Response(JSON.stringify({
+          Status: 0,
+          Answer: [{ type: 28, data: '2606:4700:4700::1111' }]
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      capturedHostHeader = req.headers.get('Host');
+      return new Response('upstream ok', { status: 200 });
+    });
+
+    try {
+      const token = await generateTestToken({ targetHost: '2606:4700:4700::1111', fault: 'none' });
+      const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+      expect(res.status).toBe(200);
+      expect(capturedHostHeader).toBe('[2606:4700:4700::1111]');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should skip payload mutilation when upstream response has compressed content-encoding (SEC-ISSUE-02)', async () => {
+    const originalFetch = globalThis.fetch;
+    const fakeCompressedBytes = new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      const urlStr = typeof req === 'string' ? req : req.url;
+      if (urlStr.includes('cloudflare-dns.com/dns-query')) {
+        return new Response(JSON.stringify({
+          Status: 0,
+          Answer: [{ type: 1, data: '93.184.216.34' }]
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(fakeCompressedBytes, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Encoding': 'gzip'
+        }
+      });
+    });
+
+    try {
+      const token = await generateTestToken({
+        targetHost: 'example.com',
+        fault: 'latency',
+        latency: 0,
+        mutilationStrategy: 'Type Poisoning'
+      });
+      const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('x-chaos-mutation-skipped')).toBe('Upstream compressed encoding not decodable');
+      expect(res.headers.get('content-encoding')).toBe('gzip');
+      const bodyBytes = new Uint8Array(await res.arrayBuffer());
+      expect(bodyBytes).toEqual(fakeCompressedBytes);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

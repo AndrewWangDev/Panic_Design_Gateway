@@ -485,7 +485,8 @@ app.all('*', async (c) => {
 
     const headers = new Headers(c.req.raw.headers)
     stripHopByHopHeaders(headers)
-    headers.set('Host', targetHost)
+    const hostHeaderVal = targetPort ? `${targetHostname}:${targetPort}` : targetHostname;
+    headers.set('Host', hostHeaderVal)
 
     // Strip chaos headers to prevent leaking credentials to upstream service
     headers.delete('x-chaos-token')
@@ -551,50 +552,59 @@ app.all('*', async (c) => {
             _chaos_intercept: "Memory corruption simulated. Payload nullified."
           }, null, 2);
         } else {
-          const contentLen = Number(response.headers.get('content-length'));
-          if (!isNaN(contentLen) && contentLen > MAX_MUTILATION_BYTES) {
-            newHeaders.set('X-Chaos-Mutation-Skipped', 'Payload exceeds 2MB limit');
+          const contentEncoding = (response.headers.get('content-encoding') || '').toLowerCase();
+          const isCompressed = contentEncoding && contentEncoding !== 'identity';
+
+          if (isCompressed) {
+            // Compressed upstream payloads cannot be safely UTF-8 decoded without corruption (SEC-ISSUE-02)
+            newHeaders.set('X-Chaos-Mutation-Skipped', 'Upstream compressed encoding not decodable');
+            resBody = response.body;
           } else {
-            const readRes = await readBodyUpToLimit(response, MAX_MUTILATION_BYTES);
-            if (readRes.exceeded) {
-              resBody = readRes.stream;
+            const contentLen = Number(response.headers.get('content-length'));
+            if (!isNaN(contentLen) && contentLen > MAX_MUTILATION_BYTES) {
               newHeaders.set('X-Chaos-Mutation-Skipped', 'Payload exceeds 2MB limit');
             } else {
-              const rawText = readRes.text || '';
-              newHeaders.delete('content-length');
-              newHeaders.delete('content-encoding');
+              const readRes = await readBodyUpToLimit(response, MAX_MUTILATION_BYTES);
+              if (readRes.exceeded) {
+                resBody = readRes.stream;
+                newHeaders.set('X-Chaos-Mutation-Skipped', 'Payload exceeds 2MB limit');
+              } else {
+                const rawText = readRes.text || '';
+                newHeaders.delete('content-length');
+                newHeaders.delete('content-encoding');
 
-              if (mutilation === 'Unexpected EOF') {
-                newHeaders.set('X-Chaos-Mutilated', 'Unexpected EOF');
-                const cutIndex = Math.floor(rawText.length * 0.7);
-                resBody = rawText.substring(0, cutIndex) + '\n\n... [ERR_TCP_RESET: CONNECTION_DROPPED_BY_PEER]';
-              } else if (mutilation === 'Type Poisoning') {
-                newHeaders.set('X-Chaos-Mutilated', 'Type Poisoning');
-                try {
-                  const ast = JSON.parse(rawText);
-                  const poison = (obj: any) => {
-                    if (Array.isArray(obj)) {
-                      obj.forEach(poison);
-                    } else if (obj && typeof obj === 'object') {
-                      for (const k in obj) {
-                        if (typeof obj[k] === 'number') {
-                          obj[k] = String(obj[k]) + "_Poisoned";
-                        } else if (typeof obj[k] === 'boolean') {
-                          obj[k] = String(obj[k]);
-                        } else if (typeof obj[k] === 'object') {
-                          poison(obj[k]);
+                if (mutilation === 'Unexpected EOF') {
+                  newHeaders.set('X-Chaos-Mutilated', 'Unexpected EOF');
+                  const cutIndex = Math.floor(rawText.length * 0.7);
+                  resBody = rawText.substring(0, cutIndex) + '\n\n... [ERR_TCP_RESET: CONNECTION_DROPPED_BY_PEER]';
+                } else if (mutilation === 'Type Poisoning') {
+                  newHeaders.set('X-Chaos-Mutilated', 'Type Poisoning');
+                  try {
+                    const ast = JSON.parse(rawText);
+                    const poison = (obj: any) => {
+                      if (Array.isArray(obj)) {
+                        obj.forEach(poison);
+                      } else if (obj && typeof obj === 'object') {
+                        for (const k in obj) {
+                          if (typeof obj[k] === 'number') {
+                            obj[k] = String(obj[k]) + "_Poisoned";
+                          } else if (typeof obj[k] === 'boolean') {
+                            obj[k] = String(obj[k]);
+                          } else if (typeof obj[k] === 'object') {
+                            poison(obj[k]);
+                          }
                         }
                       }
-                    }
-                  };
-                  poison(ast);
-                  resBody = JSON.stringify(ast, null, 2);
-                } catch {
-                  // Not JSON or depth overflow, fallback to rawText
+                    };
+                    poison(ast);
+                    resBody = JSON.stringify(ast, null, 2);
+                  } catch {
+                    // Not JSON or depth overflow, fallback to rawText
+                    resBody = rawText;
+                  }
+                } else {
                   resBody = rawText;
                 }
-              } else {
-                resBody = rawText;
               }
             }
           }
