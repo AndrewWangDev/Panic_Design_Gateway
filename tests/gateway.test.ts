@@ -51,6 +51,14 @@ describe('Data Plane: Target Host & SSRF Guardrails', () => {
     expect(isSafeTargetHost('server.local')).toBe(false);
     expect(isSafeTargetHost('app.internal')).toBe(false);
     expect(isSafeTargetHost('service.lan')).toBe(false);
+    // Self-referencing service domains & worker loop prevention (PD-AUDIT-01)
+    expect(isSafeTargetHost('gateway.andrewwangdev.com')).toBe(false);
+    expect(isSafeTargetHost('panic.andrewwangdev.com')).toBe(false);
+    expect(isSafeTargetHost('panic.design')).toBe(false);
+    expect(isSafeTargetHost('gateway.panic.design')).toBe(false);
+    expect(isSafeTargetHost('panicdesign.androwsmith7923.workers.dev')).toBe(false);
+    expect(isSafeTargetHost('custom-app.workers.dev')).toBe(false);
+    expect(isSafeTargetHost('api.andrewwangdev.com')).toBe(true);
   });
 
   it('should block URI paths, queries, fragments, credentials, and invalid ports', () => {
@@ -195,6 +203,24 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
         prepare: () => ({
           bind: () => ({
             first: async () => ({ jwtSalt: 1, isRevoked: 1 })
+          })
+        })
+      } as any
+    };
+
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, revokedDbEnv);
+    expect(res.status).toBe(401);
+    expect(await res.text()).toContain('Token has been revoked');
+  });
+
+  it('should reject revoked token when D1 returns isRevoked=true (boolean compatibility PD-AUDIT-07)', async () => {
+    const token = await generateTestToken({ fault: '429', issuedWithSalt: 1 });
+    const revokedDbEnv = {
+      AUTH_SECRET: TEST_SECRET,
+      DB: {
+        prepare: () => ({
+          bind: () => ({
+            first: async () => ({ jwtSalt: 1, isRevoked: true })
           })
         })
       } as any

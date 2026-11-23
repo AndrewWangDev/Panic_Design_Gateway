@@ -215,7 +215,7 @@ app.all('*', async (c) => {
     const cacheKey = `${userId}:${tokenId}`;
     const cached = revocationCache.get(cacheKey);
     const nowMs = Date.now();
-    let row: { jwtSalt: number; isRevoked: number } | null = null;
+    let row: { jwtSalt: number; isRevoked: number | boolean } | null = null;
 
     if (cached && (nowMs - cached.cachedAt) < REVOCATION_CACHE_TTL_MS) {
       row = { jwtSalt: cached.jwtSalt, isRevoked: cached.isRevoked };
@@ -227,11 +227,11 @@ app.all('*', async (c) => {
           JOIN Token t ON u.id = t.userId 
           WHERE t.id = ? AND u.id = ?
         `).bind(tokenId, userId);
-        row = await stmt.first<{ jwtSalt: number, isRevoked: number }>();
+        row = await stmt.first<{ jwtSalt: number, isRevoked: number | boolean }>();
         if (row) {
           revocationCache.set(cacheKey, {
             jwtSalt: row.jwtSalt,
-            isRevoked: row.isRevoked,
+            isRevoked: typeof row.isRevoked === 'boolean' ? (row.isRevoked ? 1 : 0) : row.isRevoked,
             cachedAt: nowMs
           });
           if (revocationCache.size > 1000) {
@@ -253,7 +253,7 @@ app.all('*', async (c) => {
     if (!row) {
       return c.text('Panic Gateway: Token or User not found', 401)
     }
-    if (row.isRevoked === 1 || (issuedWithSalt !== undefined && row.jwtSalt !== issuedWithSalt)) {
+    if (Boolean(row.isRevoked) || (issuedWithSalt !== undefined && row.jwtSalt !== issuedWithSalt)) {
       return c.text('Panic Gateway: Token has been revoked', 401)
     }
 
@@ -966,6 +966,16 @@ export function isSafeTargetHost(rawHost: string): boolean {
     'broadcasthost'
   ]);
   if (blockedExact.has(hostname)) return false;
+
+  // Block self-referencing service domains & worker-to-worker loop candidates (PD-AUDIT-01)
+  const blockedSelfDomains = new Set([
+    'gateway.andrewwangdev.com',
+    'panic.andrewwangdev.com',
+    'panic.design',
+    'gateway.panic.design',
+    'panicdesign.androwsmith7923.workers.dev'
+  ]);
+  if (blockedSelfDomains.has(hostname) || hostname.endsWith('.workers.dev')) return false;
 
   const blockedSuffixes = [
     '.localhost',
