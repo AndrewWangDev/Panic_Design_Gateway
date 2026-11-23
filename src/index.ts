@@ -125,6 +125,10 @@ export function _clearRevocationCache() {
   dnsResolutionCache.clear();
 }
 
+export function _getTelemetryThrottleCacheSize(): number {
+  return telemetryThrottleCache.size;
+}
+
 const app = new Hono<{ Bindings: Bindings }>()
 
 // Zero-Trust CORS Support for Browser SPAs & Web UI Interceptor
@@ -719,6 +723,10 @@ function logTelemetryAsync(c: any, payload: any, options: TelemetryOptions = {})
       if (!rec || (nowTime - rec.windowStart) >= 1000) {
         rec = { count: 1, windowStart: nowTime };
         telemetryThrottleCache.set(tokenId, rec);
+        if (telemetryThrottleCache.size > 2000) {
+          const oldestKey = telemetryThrottleCache.keys().next().value;
+          if (oldestKey) telemetryThrottleCache.delete(oldestKey);
+        }
       } else {
         if (rec.count >= TELEMETRY_MAX_WRITES_PER_SEC) {
           shouldInsertLog = false;

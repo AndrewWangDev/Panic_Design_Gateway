@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import app, { isSafeTargetHost, isPrivateIp, sanitizeTargetUrl, _clearRevocationCache, checkDomainDnsSafety, checkTokenRateLimit } from '../src/index';
+import app, { isSafeTargetHost, isPrivateIp, sanitizeTargetUrl, _clearRevocationCache, checkDomainDnsSafety, checkTokenRateLimit, _getTelemetryThrottleCacheSize } from '../src/index';
 import { SignJWT } from 'jose';
 
 const TEST_SECRET = 'mock-test-secret-for-vitest-suite-only-hs256-signature-key-256bit';
@@ -546,5 +546,31 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
 
     const res2 = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, failingDbEnv);
     expect(res2.status).toBe(429);
+  });
+
+  it('should cap telemetryThrottleCache size to 2000 and evict oldest entries (PD-NEW-01)', async () => {
+    const mockDbEnv = {
+      AUTH_SECRET: TEST_SECRET,
+      DB: {
+        prepare: () => ({
+          bind: () => ({
+            first: async () => ({ jwtSalt: 0, isRevoked: 0 }),
+            run: async () => ({ success: true })
+          })
+        })
+      } as any
+    };
+
+    // Generate 2005 distinct tokens and send requests to populate telemetryThrottleCache
+    const tokens = await Promise.all(
+      Array.from({ length: 2005 }, (_, i) => generateTestToken({ tokenId: `token-evict-${i}`, fault: '429' }))
+    );
+
+    for (let i = 0; i < tokens.length; i++) {
+      await app.request(`https://gateway.andrewwangdev.com/?token=${tokens[i]}`, {}, mockDbEnv);
+    }
+
+    expect(_getTelemetryThrottleCacheSize()).toBeLessThanOrEqual(2000);
+    expect(_getTelemetryThrottleCacheSize()).toBe(2000);
   });
 });
