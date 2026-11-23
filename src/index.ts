@@ -75,7 +75,7 @@ export async function checkDomainDnsSafety(hostname: string): Promise<boolean> {
     return cached.safe;
   }
 
-  let safe = true;
+  let safe = false;
   try {
     const queryDns = async (qtype: 'A' | 'AAAA'): Promise<string[]> => {
       try {
@@ -99,14 +99,11 @@ export async function checkDomainDnsSafety(hostname: string): Promise<boolean> {
 
     const [v4List, v6List] = await Promise.all([queryDns('A'), queryDns('AAAA')]);
     const allIps = [...v4List, ...v6List];
-    for (const ip of allIps) {
-      if (isPrivateIp(ip)) {
-        safe = false;
-        break;
-      }
+    if (allIps.length > 0 && allIps.every(ip => !isPrivateIp(ip))) {
+      safe = true;
     }
   } catch {
-    // Fallback
+    safe = false;
   }
 
   dnsResolutionCache.set(domain, { safe, cachedAt: now });

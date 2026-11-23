@@ -398,6 +398,13 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     let capturedHeaders: Headers | null = null;
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      const urlStr = typeof req === 'string' ? req : req.url;
+      if (urlStr.includes('cloudflare-dns.com/dns-query')) {
+        return new Response(JSON.stringify({
+          Status: 0,
+          Answer: [{ type: 1, data: '93.184.216.34' }]
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
       capturedHeaders = req.headers;
       return new Response('upstream ok', { status: 200 });
     });
@@ -424,6 +431,13 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     let capturedHeaders: Headers | null = null;
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      const urlStr = typeof req === 'string' ? req : req.url;
+      if (urlStr.includes('cloudflare-dns.com/dns-query')) {
+        return new Response(JSON.stringify({
+          Status: 0,
+          Answer: [{ type: 1, data: '93.184.216.34' }]
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
       capturedHeaders = req.headers;
       return new Response('upstream ok', { status: 200 });
     });
@@ -497,6 +511,54 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
       expect(isSafe).toBe(false);
 
       const token = await generateTestToken({ targetHost: 'rebind.attacker.internal-test.com' });
+      const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain('Forbidden Target Host (SSRF Blocked)');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should fail-closed (block) when DoH resolution fails or returns empty answers (PD-AUDIT-02)', async () => {
+    const originalFetch = globalThis.fetch;
+    // 1. Mock DoH returning empty answers (NXDOMAIN or no A/AAAA)
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      const urlStr = typeof req === 'string' ? req : req.url;
+      if (urlStr.includes('cloudflare-dns.com/dns-query')) {
+        return new Response(JSON.stringify({
+          Status: 3, // NXDOMAIN
+          Answer: []
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('upstream ok', { status: 200 });
+    });
+
+    try {
+      const isSafeEmpty = await checkDomainDnsSafety('unresolvable-domain-test.com');
+      expect(isSafeEmpty).toBe(false);
+
+      const token = await generateTestToken({ targetHost: 'unresolvable-domain-test.com' });
+      const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain('Forbidden Target Host (SSRF Blocked)');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    // 2. Mock DoH throwing network error / timeout
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      const urlStr = typeof req === 'string' ? req : req.url;
+      if (urlStr.includes('cloudflare-dns.com/dns-query')) {
+        throw new Error('DoH resolution timeout');
+      }
+      return new Response('upstream ok', { status: 200 });
+    });
+
+    try {
+      const isSafeTimeout = await checkDomainDnsSafety('timeout-domain-test.com');
+      expect(isSafeTimeout).toBe(false);
+
+      const token = await generateTestToken({ targetHost: 'timeout-domain-test.com' });
       const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
       expect(res.status).toBe(400);
       expect(await res.text()).toContain('Forbidden Target Host (SSRF Blocked)');
