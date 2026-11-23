@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import app, { isSafeTargetHost, isPrivateIp, sanitizeTargetUrl, _clearRevocationCache } from '../src/index';
+import app, { isSafeTargetHost, isPrivateIp, sanitizeTargetUrl, _clearRevocationCache, checkDomainDnsSafety, checkTokenRateLimit } from '../src/index';
 import { SignJWT } from 'jose';
 
 const TEST_SECRET = 'mock-test-secret-for-vitest-suite-only-hs256-signature-key-256bit';
@@ -173,6 +173,9 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
           bind: () => ({
             first: async () => {
               throw new Error('D1 connection timeout');
+            },
+            run: async () => {
+              throw new Error('D1 write timeout');
             }
           })
         })
@@ -473,5 +476,75 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     expect(res.status).toBe(400);
     const body = await res.text();
     expect(body).toContain('Forbidden Target Host (SSRF Blocked)');
+  });
+
+  it('should block DNS rebinding via DoH resolution check (PD-ISSUE-01)', async () => {
+    const originalFetch = globalThis.fetch;
+    // Mock DoH query returning a private IP for an attacker-controlled domain
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      const urlStr = typeof req === 'string' ? req : req.url;
+      if (urlStr.includes('cloudflare-dns.com/dns-query')) {
+        return new Response(JSON.stringify({
+          Status: 0,
+          Answer: [{ type: 1, data: '169.254.169.254' }]
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('upstream ok', { status: 200 });
+    });
+
+    try {
+      const isSafe = await checkDomainDnsSafety('rebind.attacker.internal-test.com');
+      expect(isSafe).toBe(false);
+
+      const token = await generateTestToken({ targetHost: 'rebind.attacker.internal-test.com' });
+      const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain('Forbidden Target Host (SSRF Blocked)');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should enforce sliding window rate limiting per Token (PD-ISSUE-02)', async () => {
+    const testTokenId = 'flood-test-token-' + Date.now();
+    for (let i = 0; i < 60; i++) {
+      expect(checkTokenRateLimit(testTokenId)).toBe(true);
+    }
+    // 61st request in the 10s window must fail
+    expect(checkTokenRateLimit(testTokenId)).toBe(false);
+
+    const token = await generateTestToken({ tokenId: testTokenId, fault: '429' });
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+    expect(res.status).toBe(429);
+    const data = await res.json() as any;
+    expect(data.error.code).toBe('rate_limit_exceeded');
+    expect(data.error.policy).toBe('token_sliding_window_limit');
+  });
+
+  it('should fallback to stale cache on D1 database connection errors (PD-ISSUE-02)', async () => {
+    const token = await generateTestToken({ fault: '429', tokenId: 'stale-fallback-token' });
+    // First request populates revocationCache
+    const res1 = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+    expect(res1.status).toBe(429);
+
+    // Second request with failing D1 should use stale cache instead of 503
+    const failingDbEnv = {
+      AUTH_SECRET: TEST_SECRET,
+      DB: {
+        prepare: () => ({
+          bind: () => ({
+            first: async () => {
+              throw new Error('D1 connection timeout');
+            },
+            run: async () => {
+              throw new Error('D1 write timeout');
+            }
+          })
+        })
+      } as any
+    };
+
+    const res2 = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, failingDbEnv);
+    expect(res2.status).toBe(429);
   });
 });

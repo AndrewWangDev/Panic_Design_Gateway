@@ -21,9 +21,108 @@ const revocationCache = new Map<string, RevocationCacheEntry>();
 const LAST_USED_THROTTLE_MS = 60000;
 const lastUsedThrottleCache = new Map<string, number>();
 
+// In-memory sliding window rate limiter per Token (max 60 req/10s per token)
+type RateLimitRecord = {
+  timestamps: number[];
+};
+const RATE_LIMIT_WINDOW_MS = 10000;
+const RATE_LIMIT_MAX_REQUESTS = 60;
+const tokenRateLimitCache = new Map<string, RateLimitRecord>();
+
+export function checkTokenRateLimit(tokenId: string): boolean {
+  const now = Date.now();
+  let record = tokenRateLimitCache.get(tokenId);
+  if (!record) {
+    record = { timestamps: [] };
+    tokenRateLimitCache.set(tokenId, record);
+  }
+  record.timestamps = record.timestamps.filter(t => (now - t) < RATE_LIMIT_WINDOW_MS);
+  if (record.timestamps.length >= RATE_LIMIT_MAX_REQUESTS) {
+    return false;
+  }
+  record.timestamps.push(now);
+  if (tokenRateLimitCache.size > 2000) {
+    const oldestKey = tokenRateLimitCache.keys().next().value;
+    if (oldestKey) tokenRateLimitCache.delete(oldestKey);
+  }
+  return true;
+}
+
+// In-memory throttle for ChaosLog writes (max 5 writes/s per token) to prevent D1 single-writer lock saturation
+type TelemetryThrottleRecord = {
+  count: number;
+  windowStart: number;
+};
+const TELEMETRY_MAX_WRITES_PER_SEC = 5;
+const telemetryThrottleCache = new Map<string, TelemetryThrottleRecord>();
+
+// In-memory DoH DNS resolution cache (60s TTL) to prevent DNS rebinding SSRF
+type DnsCacheEntry = {
+  safe: boolean;
+  cachedAt: number;
+};
+const DNS_CACHE_TTL_MS = 60000;
+const dnsResolutionCache = new Map<string, DnsCacheEntry>();
+
+export async function checkDomainDnsSafety(hostname: string): Promise<boolean> {
+  const domain = hostname.toLowerCase().trim();
+  if (/^[0-9.]+$/.test(domain) || domain.includes(':') || /^0x/i.test(domain)) {
+    return !isPrivateIp(domain);
+  }
+  const now = Date.now();
+  const cached = dnsResolutionCache.get(domain);
+  if (cached && (now - cached.cachedAt) < DNS_CACHE_TTL_MS) {
+    return cached.safe;
+  }
+
+  let safe = true;
+  try {
+    const queryDns = async (qtype: 'A' | 'AAAA'): Promise<string[]> => {
+      try {
+        const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${qtype}`, {
+          headers: { accept: 'application/dns-json' },
+          signal: AbortSignal.timeout(3000)
+        });
+        if (!res.ok) return [];
+        const data = await res.json() as any;
+        if (data && data.Status === 0 && Array.isArray(data.Answer)) {
+          const expectedType = qtype === 'A' ? 1 : 28;
+          return data.Answer
+            .filter((a: any) => a.type === expectedType && typeof a.data === 'string')
+            .map((a: any) => a.data);
+        }
+      } catch {
+        // Fallback
+      }
+      return [];
+    };
+
+    const [v4List, v6List] = await Promise.all([queryDns('A'), queryDns('AAAA')]);
+    const allIps = [...v4List, ...v6List];
+    for (const ip of allIps) {
+      if (isPrivateIp(ip)) {
+        safe = false;
+        break;
+      }
+    }
+  } catch {
+    // Fallback
+  }
+
+  dnsResolutionCache.set(domain, { safe, cachedAt: now });
+  if (dnsResolutionCache.size > 1000) {
+    const firstKey = dnsResolutionCache.keys().next().value;
+    if (firstKey) dnsResolutionCache.delete(firstKey);
+  }
+  return safe;
+}
+
 export function _clearRevocationCache() {
   revocationCache.clear();
   lastUsedThrottleCache.clear();
+  tokenRateLimitCache.clear();
+  telemetryThrottleCache.clear();
+  dnsResolutionCache.clear();
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -78,9 +177,33 @@ app.all('*', async (c) => {
       return c.text('Panic Gateway: Malformed Chaos Token', 400)
     }
 
+    // In-memory sliding window rate limiter: prevent resource exhaustion & abuse
+    if (!checkTokenRateLimit(tokenId)) {
+      return c.json({
+        error: {
+          code: "rate_limit_exceeded",
+          message: "Rate limit exceeded. Maximum 60 requests per 10 seconds per token.",
+          policy: "token_sliding_window_limit",
+          retry_after_seconds: 5
+        }
+      }, 429);
+    }
+
     // Zero-Trust Second-Layer SSRF Defense: validate target host against private networks
     if (!isSafeTargetHost(targetHost)) {
       return c.text('Panic Gateway: Forbidden Target Host (SSRF Blocked)', 400)
+    }
+
+    // Real-time DNS resolution & rebinding defense: ensure resolved IPs are not private
+    let hostOnly = targetHost;
+    if (targetHost.startsWith('[')) {
+      const m = targetHost.match(/^\[([0-9a-f:]+)\](?::(\d{1,5}))?$/);
+      if (m) hostOnly = m[1];
+    } else if (targetHost.includes(':') && !targetHost.includes('::')) {
+      hostOnly = targetHost.split(':')[0];
+    }
+    if (!(await checkDomainDnsSafety(hostOnly))) {
+      return c.text('Panic Gateway: Forbidden Target Host (SSRF Blocked)', 400);
     }
 
     if (!c.env.DB) {
@@ -117,7 +240,12 @@ app.all('*', async (c) => {
         }
       } catch (dbErr) {
         console.error('Panic Gateway DB Check Error:', dbErr);
-        return c.text('Panic Gateway: Revocation check unavailable', 503);
+        // Stale-while-revalidate fallback: tolerate transient D1 connection errors if cached within 60s
+        if (cached && (nowMs - cached.cachedAt) < 60000) {
+          row = { jwtSalt: cached.jwtSalt, isRevoked: cached.isRevoked };
+        } else {
+          return c.text('Panic Gateway: Revocation check unavailable', 503);
+        }
       }
     }
 
@@ -547,80 +675,106 @@ interface TelemetryOptions {
 
 // Asynchronous Logging with backward-compatible schema fallback
 function logTelemetryAsync(c: any, payload: any, options: TelemetryOptions = {}) {
-  if (!c.env.DB) return;
-  const userId = payload.userId;
-  const tokenId = payload.tokenId;
-  const fault = options.isFailOpen ? 'PASSTHROUGH' : payload.fault;
-  const source = payload.source || 'DIRECT_DATA_PLANE';
-  
-  // Extract genuine JWT token hint from request or payload
-  let tokenHint: string | null = null;
-  const rawToken = c.req.query('token') || c.req.header('X-Chaos-Token') || (c.req.header('Authorization')?.replace(/^Bearer\s+/i, '')) || '';
-  if (rawToken && rawToken.startsWith('eyJ')) {
-    tokenHint = `eyJhbGci...${rawToken.slice(-4)}`;
-  } else if (typeof payload.tokenHint === 'string' && payload.tokenHint.startsWith('eyJ')) {
-    tokenHint = payload.tokenHint;
-  } else if (tokenId) {
-    tokenHint = `eyJhbGci...${String(tokenId).slice(-4)}`;
-  }
-  
-  const latencyAdded = options.latencyAdded ?? 0;
-  let rawTarget = options.targetUrl || (payload.targetHost ? `https://${payload.targetHost}` : '');
-  if (!rawTarget || rawTarget === 'target' || rawTarget === 'https://target') {
-    rawTarget = payload.targetHost ? `https://${payload.targetHost}` : 'https://jsonplaceholder.typicode.com';
-  }
-  const targetUrl = sanitizeTargetUrl(rawTarget);
-  const statusCode = options.statusCode ?? (fault === '502' ? 502 : fault === '504' ? 504 : fault === '429' ? 429 : 200);
-  const rayId = options.rayId || c.req.header('cf-ray') || 'unknown';
-  const rayColo = rayId.includes('-') ? rayId.split('-')[1]?.toUpperCase() : null;
-  const edgeColo = options.edgeColo || (c.req.raw.cf?.colo as string) || rayColo || 'EDGE';
-
-  const now = new Date();
-  const isoTime = now.toISOString();
-  const nowTime = now.getTime();
-
-  // In-memory throttle: only write UPDATE Token SET lastUsedAt to D1 if > 60s has elapsed for this token
-  const lastUpdate = lastUsedThrottleCache.get(tokenId) || 0;
-  const shouldUpdateLastUsed = (nowTime - lastUpdate) > LAST_USED_THROTTLE_MS;
-
-  const updatePromises: Promise<any>[] = [
-    // Insert Chaos Log with structured fields (falls back to legacy 5-param insert if table not yet migrated)
-    c.env.DB.prepare(`
-      INSERT INTO ChaosLog (
-        id, userId, targetUrl, injectedFault, executedAt,
-        source, tokenId, tokenHint, edgeColo, statusCode, latencyMs, rayId
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      crypto.randomUUID(), userId, targetUrl, fault, isoTime,
-      source, tokenId, tokenHint, edgeColo, statusCode, latencyAdded, rayId
-    ).run().catch((_insertErr: any) => {
-      return c.env.DB.prepare('INSERT INTO ChaosLog (id, userId, targetUrl, injectedFault, executedAt) VALUES (?, ?, ?, ?, ?)')
-        .bind(crypto.randomUUID(), userId, targetUrl, fault, isoTime)
-        .run();
-    })
-  ];
-
-  if (shouldUpdateLastUsed) {
-    lastUsedThrottleCache.set(tokenId, nowTime);
-    if (lastUsedThrottleCache.size > 1000) {
-      const oldestKey = lastUsedThrottleCache.keys().next().value;
-      if (oldestKey) lastUsedThrottleCache.delete(oldestKey);
-    }
-    updatePromises.push(
-      c.env.DB.prepare('UPDATE Token SET lastUsedAt = ? WHERE id = ?')
-        .bind(isoTime, tokenId)
-        .run()
-    );
-  }
-
-  const telemetryPromise = Promise.all(updatePromises).catch((err: any) => console.error('Panic Gateway Telemetry Error:', err));
-
   try {
-    if (c.executionCtx?.waitUntil) {
-      c.executionCtx.waitUntil(telemetryPromise);
+    if (!c.env?.DB) return;
+    const userId = payload.userId;
+    const tokenId = payload.tokenId;
+    const fault = options.isFailOpen ? 'PASSTHROUGH' : payload.fault;
+    const source = payload.source || 'DIRECT_DATA_PLANE';
+    
+    // Extract genuine JWT token hint from request or payload
+    let tokenHint: string | null = null;
+    const rawToken = c.req.query('token') || c.req.header('X-Chaos-Token') || (c.req.header('Authorization')?.replace(/^Bearer\s+/i, '')) || '';
+    if (rawToken && rawToken.startsWith('eyJ')) {
+      tokenHint = `eyJhbGci...${rawToken.slice(-4)}`;
+    } else if (typeof payload.tokenHint === 'string' && payload.tokenHint.startsWith('eyJ')) {
+      tokenHint = payload.tokenHint;
+    } else if (tokenId) {
+      tokenHint = `eyJhbGci...${String(tokenId).slice(-4)}`;
     }
-  } catch {
-    // Vitest/mock runner without Worker ExecutionContext
+    
+    const latencyAdded = options.latencyAdded ?? 0;
+    let rawTarget = options.targetUrl || (payload.targetHost ? `https://${payload.targetHost}` : '');
+    if (!rawTarget || rawTarget === 'target' || rawTarget === 'https://target') {
+      rawTarget = payload.targetHost ? `https://${payload.targetHost}` : 'https://jsonplaceholder.typicode.com';
+    }
+    const targetUrl = sanitizeTargetUrl(rawTarget);
+    const statusCode = options.statusCode ?? (fault === '502' ? 502 : fault === '504' ? 504 : fault === '429' ? 429 : 200);
+    const rayId = options.rayId || c.req.header('cf-ray') || 'unknown';
+    const rayColo = rayId.includes('-') ? rayId.split('-')[1]?.toUpperCase() : null;
+    const edgeColo = options.edgeColo || (c.req.raw.cf?.colo as string) || rayColo || 'EDGE';
+
+    const now = new Date();
+    const isoTime = now.toISOString();
+    const nowTime = now.getTime();
+
+    // In-memory throttle: only write UPDATE Token SET lastUsedAt to D1 if > 60s has elapsed for this token
+    const lastUpdate = lastUsedThrottleCache.get(tokenId) || 0;
+    const shouldUpdateLastUsed = (nowTime - lastUpdate) > LAST_USED_THROTTLE_MS;
+
+    // In-memory throttle: max 5 writes/s per token for ChaosLog to prevent D1 single-writer queue saturation
+    let shouldInsertLog = true;
+    if (tokenId) {
+      let rec = telemetryThrottleCache.get(tokenId);
+      if (!rec || (nowTime - rec.windowStart) >= 1000) {
+        rec = { count: 1, windowStart: nowTime };
+        telemetryThrottleCache.set(tokenId, rec);
+      } else {
+        if (rec.count >= TELEMETRY_MAX_WRITES_PER_SEC) {
+          shouldInsertLog = false;
+        } else {
+          rec.count++;
+        }
+      }
+    }
+
+    const updatePromises: Promise<any>[] = [];
+
+    if (shouldInsertLog && typeof c.env.DB.prepare === 'function') {
+      // Insert Chaos Log with structured fields (falls back to legacy 5-param insert if table not yet migrated)
+      updatePromises.push(
+        c.env.DB.prepare(`
+          INSERT INTO ChaosLog (
+            id, userId, targetUrl, injectedFault, executedAt,
+            source, tokenId, tokenHint, edgeColo, statusCode, latencyMs, rayId
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          crypto.randomUUID(), userId, targetUrl, fault, isoTime,
+          source, tokenId, tokenHint, edgeColo, statusCode, latencyAdded, rayId
+        ).run().catch((_insertErr: any) => {
+          return c.env.DB.prepare('INSERT INTO ChaosLog (id, userId, targetUrl, injectedFault, executedAt) VALUES (?, ?, ?, ?, ?)')
+            .bind(crypto.randomUUID(), userId, targetUrl, fault, isoTime)
+            .run();
+        })
+      );
+    }
+
+    if (shouldUpdateLastUsed && typeof c.env.DB.prepare === 'function') {
+      lastUsedThrottleCache.set(tokenId, nowTime);
+      if (lastUsedThrottleCache.size > 1000) {
+        const oldestKey = lastUsedThrottleCache.keys().next().value;
+        if (oldestKey) lastUsedThrottleCache.delete(oldestKey);
+      }
+      updatePromises.push(
+        c.env.DB.prepare('UPDATE Token SET lastUsedAt = ? WHERE id = ?')
+          .bind(isoTime, tokenId)
+          .run()
+      );
+    }
+
+    if (updatePromises.length === 0) return;
+
+    const telemetryPromise = Promise.all(updatePromises).catch((err: any) => console.error('Panic Gateway Telemetry Error:', err));
+
+    try {
+      if (c.executionCtx?.waitUntil) {
+        c.executionCtx.waitUntil(telemetryPromise);
+      }
+    } catch {
+      // Vitest/mock runner without Worker ExecutionContext
+    }
+  } catch (err: any) {
+    console.error('Panic Gateway Telemetry Synchronous Error:', err);
   }
 }
 
