@@ -60,3 +60,12 @@ npm run dev
 ```bash
 npm run deploy
 ```
+
+---
+
+## 🛡️ Security Model & Architectural SLA Disclosures
+
+- **Revocation Consistency (SEC-02)**: In-memory micro-cache provides a nominal **5-second** revocation SLA. Under D1 database brownout, an automatic **60-second Stale-While-Revalidate (SWR)** fallback preserves proxy availability while failing closed if database connectivity is unrecovered.
+- **Outbound Fetch Model (SEC-01)**: The gateway executes DoH safety checks on incoming target hosts. Under the Cloudflare Workers Serverless platform, outbound connections are routed via Cloudflare Anycast; socket-level IP pinning is an inherent platform limitation.
+- **Telemetry Semantics (DATA-01, DATA-02)**: Header `x-panic-w1` represents the Cloudflare Ingress PoP location of the connecting client. Timings `x-panic-t1` and `x-panic-t3` represent estimated differential transit durations.
+- **Cryptographic Isolation (SEC-03)**: A dedicated `CHAOS_JWT_SECRET` is strongly enforced in production environments to cryptographically decouple data-plane token verification from web application session management.

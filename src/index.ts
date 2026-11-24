@@ -177,9 +177,12 @@ app.all('*', async (c) => {
 
     let payload: any;
     try {
+      if (!c.env.CHAOS_JWT_SECRET && c.env.AUTH_SECRET) {
+        console.warn('[SECURITY WARNING] Dedicated CHAOS_JWT_SECRET is missing. Falling back to AUTH_SECRET (SEC-03).');
+      }
       const jwtSecret = c.env.CHAOS_JWT_SECRET || c.env.AUTH_SECRET;
       if (!jwtSecret) {
-        return c.text('Panic Gateway: AUTH_SECRET not configured', 500)
+        return c.text('Panic Gateway: Neither CHAOS_JWT_SECRET nor AUTH_SECRET configured', 500)
       }
 
       // Step 1: Pure in-memory decryption and signature verification (< 1ms)
@@ -330,7 +333,9 @@ app.all('*', async (c) => {
     }
 
     let finalDelay = 0;
-    // Helper to build headers early for aborts
+    // Helper to build headers early for aborts and responses
+    // DATA-01: x-panic-w1 represents the Client Ingress Edge PoP coordinates (Cloudflare ingress DC)
+    // DATA-02: x-panic-t2 is injected delay; x-panic-t3 represents estimated upstream backhaul latency
     const buildHeaders = (t2: number, t3: number) => {
       const rayHeader = c.req.header('cf-ray') || '';
       const rayColo = rayHeader.includes('-') ? rayHeader.split('-')[1]?.toUpperCase() : null;
