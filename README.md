@@ -40,14 +40,12 @@ database_name = "panic_design"
 database_id = "<your-d1-database-id>"
 ```
 
-Set the JWT signing secret (must match the `CHAOS_JWT_SECRET` / `AUTH_SECRET` used by the control-plane):
+Set the dedicated JWT signing secret (must match the `CHAOS_JWT_SECRET` used by the control-plane):
 ```bash
 # For local development (.dev.vars)
-echo 'AUTH_SECRET="your-shared-secret-hex-or-string"' > .dev.vars
-echo 'CHAOS_JWT_SECRET="your-shared-secret-hex-or-string"' >> .dev.vars
+echo 'CHAOS_JWT_SECRET="your-dedicated-chaos-jwt-secret-hex-or-string"' > .dev.vars
 
-# For production deployment
-npx wrangler secret put AUTH_SECRET
+# For production deployment (required: Fail-Closed without CHAOS_JWT_SECRET)
 npx wrangler secret put CHAOS_JWT_SECRET
 ```
 

@@ -110,7 +110,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
   };
 
   const mockEnv = {
-    AUTH_SECRET: TEST_SECRET,
+    CHAOS_JWT_SECRET: TEST_SECRET,
     DB: defaultMockDb as any
   };
 
@@ -175,7 +175,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
   it('should fail closed (503) when D1 revocation check throws a database error', async () => {
     const token = await generateTestToken({ fault: '429' });
     const failingDbEnv = {
-      AUTH_SECRET: TEST_SECRET,
+      CHAOS_JWT_SECRET: TEST_SECRET,
       DB: {
         prepare: () => ({
           bind: () => ({
@@ -198,7 +198,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
   it('should reject revoked token when D1 returns isRevoked=1', async () => {
     const token = await generateTestToken({ fault: '429', issuedWithSalt: 1 });
     const revokedDbEnv = {
-      AUTH_SECRET: TEST_SECRET,
+      CHAOS_JWT_SECRET: TEST_SECRET,
       DB: {
         prepare: () => ({
           bind: () => ({
@@ -216,7 +216,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
   it('should reject revoked token when D1 returns isRevoked=true (boolean compatibility PD-AUDIT-07)', async () => {
     const token = await generateTestToken({ fault: '429', issuedWithSalt: 1 });
     const revokedDbEnv = {
-      AUTH_SECRET: TEST_SECRET,
+      CHAOS_JWT_SECRET: TEST_SECRET,
       DB: {
         prepare: () => ({
           bind: () => ({
@@ -263,7 +263,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
 
     const token = await generateTestToken({ fault: '429', source: 'AGENT_API', tokenHint: 'cly12345...' });
     const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, {
-      AUTH_SECRET: TEST_SECRET,
+      CHAOS_JWT_SECRET: TEST_SECRET,
       DB: mockDb as any
     });
     expect(res.status).toBe(429);
@@ -296,6 +296,16 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
       DB: defaultMockDb as any
     });
     expect(res.status).toBe(429);
+  });
+
+  it('should fail closed (500) when CHAOS_JWT_SECRET is missing (Fail-Closed SEC-03-EXT)', async () => {
+    const token = await generateTestToken({ fault: '502' });
+    const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, {
+      AUTH_SECRET: TEST_SECRET, // Even if AUTH_SECRET is provided, Gateway MUST refuse without CHAOS_JWT_SECRET
+      DB: defaultMockDb as any
+    });
+    expect(res.status).toBe(500);
+    expect(await res.text()).toContain('Panic Gateway: CHAOS_JWT_SECRET not configured (Fail-Closed)');
   });
 
   it('should support CORS preflight OPTIONS request with allow headers', async () => {
@@ -332,7 +342,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
   it('should leverage revocation micro-cache to prevent duplicate D1 queries within TTL', async () => {
     let d1QueryCount = 0;
     const trackingDbEnv = {
-      AUTH_SECRET: TEST_SECRET,
+      CHAOS_JWT_SECRET: TEST_SECRET,
       DB: {
         prepare: () => ({
           bind: () => ({
@@ -360,7 +370,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
 
   it('should clamp x-panic-t2 header to non-negative (>= 0) even when jitter > latency', async () => {
     const mockEnv = {
-      AUTH_SECRET: TEST_SECRET,
+      CHAOS_JWT_SECRET: TEST_SECRET,
       DB: {
         prepare: () => ({
           bind: () => ({
@@ -383,7 +393,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
   it('should throttle Token.lastUsedAt updates to at most once per minute', async () => {
     let updateTokenCount = 0;
     const trackingDbEnv = {
-      AUTH_SECRET: TEST_SECRET,
+      CHAOS_JWT_SECRET: TEST_SECRET,
       DB: {
         prepare: (sql: string) => ({
           bind: () => ({
@@ -412,7 +422,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
   it('should fail closed (500) when D1 database binding is missing', async () => {
     const token = await generateTestToken({ fault: '429' });
     const noDbEnv = {
-      AUTH_SECRET: TEST_SECRET,
+      CHAOS_JWT_SECRET: TEST_SECRET,
       DB: null as any
     };
     const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, noDbEnv);
@@ -617,7 +627,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
 
     // Second request with failing D1 should use stale cache instead of 503
     const failingDbEnv = {
-      AUTH_SECRET: TEST_SECRET,
+      CHAOS_JWT_SECRET: TEST_SECRET,
       DB: {
         prepare: () => ({
           bind: () => ({
@@ -638,7 +648,7 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
 
   it('should cap telemetryThrottleCache size to 2000 and evict oldest entries (PD-NEW-01)', async () => {
     const mockDbEnv = {
-      AUTH_SECRET: TEST_SECRET,
+      CHAOS_JWT_SECRET: TEST_SECRET,
       DB: {
         prepare: () => ({
           bind: () => ({

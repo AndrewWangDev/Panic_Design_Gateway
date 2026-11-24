@@ -177,12 +177,10 @@ app.all('*', async (c) => {
 
     let payload: any;
     try {
-      if (!c.env.CHAOS_JWT_SECRET && c.env.AUTH_SECRET) {
-        console.warn('[SECURITY WARNING] Dedicated CHAOS_JWT_SECRET is missing. Falling back to AUTH_SECRET (SEC-03).');
-      }
-      const jwtSecret = c.env.CHAOS_JWT_SECRET || c.env.AUTH_SECRET;
+      const jwtSecret = c.env.CHAOS_JWT_SECRET;
       if (!jwtSecret) {
-        return c.text('Panic Gateway: Neither CHAOS_JWT_SECRET nor AUTH_SECRET configured', 500)
+        console.error('[SECURITY FATAL] Dedicated CHAOS_JWT_SECRET is missing. Rejecting request (Fail-Closed SEC-03-EXT).');
+        return c.text('Panic Gateway: CHAOS_JWT_SECRET not configured (Fail-Closed)', 500);
       }
 
       // Step 1: Pure in-memory decryption and signature verification (< 1ms)
