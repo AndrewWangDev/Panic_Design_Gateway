@@ -789,4 +789,75 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it('should strip Set-Cookie and inject CSP/nosniff on proxied responses (PD-SEC-01)', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      const urlStr = typeof req === 'string' ? req : req.url;
+      if (urlStr.includes('cloudflare-dns.com/dns-query')) {
+        return new Response(JSON.stringify({
+          Status: 0,
+          Answer: [{ type: 1, data: '93.184.216.34' }]
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      const h = new Headers();
+      h.set('Set-Cookie', 'session=malicious; Domain=.andrewwangdev.com; Path=/');
+      h.set('Set-Cookie2', 'session2=malicious');
+      h.set('Access-Control-Allow-Credentials', 'true');
+      return new Response('proxied content', { status: 200, headers: h });
+    });
+
+    try {
+      const token = await generateTestToken({ targetHost: 'api.example.com', fault: 'latency', latency: 0 });
+      const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {
+        headers: { 'Origin': 'https://untrusted-third-party.com' }
+      }, mockEnv);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('set-cookie')).toBeNull();
+      expect(res.headers.get('set-cookie2')).toBeNull();
+      expect(res.headers.get('access-control-allow-credentials')).toBeNull();
+      expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+      expect(res.headers.get('content-security-policy')).toBe("sandbox; default-src 'none';");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should handle 204 No Content with null body without throwing TypeError (PD-BUG-01)', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      const urlStr = typeof req === 'string' ? req : req.url;
+      if (urlStr.includes('cloudflare-dns.com/dns-query')) {
+        return new Response(JSON.stringify({
+          Status: 0,
+          Answer: [{ type: 1, data: '93.184.216.34' }]
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(null, { status: 204, statusText: 'No Content' });
+    });
+
+    try {
+      const token = await generateTestToken({ targetHost: 'api.example.com', fault: 'latency', latency: 0, mutilationStrategy: 'Empty Shell' });
+      const res = await app.request(`https://gateway.andrewwangdev.com/?token=${token}`, {}, mockEnv);
+      expect(res.status).toBe(204);
+      expect(res.body).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should block NAT64 and Teredo IPv6 addresses resolving to private IPv4 (PD-SEC-03)', () => {
+    // NAT64 Well-Known prefix (64:ff9b::/96) mapping private 127.0.0.1
+    expect(isPrivateIp('64:ff9b::127.0.0.1')).toBe(true);
+    expect(isPrivateIp('64:ff9b::10.0.0.1')).toBe(true);
+    expect(isPrivateIp('64:ff9b::192.168.1.1')).toBe(true);
+    // NAT64 Local-Use prefix (64:ff9b:1::/48)
+    expect(isPrivateIp('64:ff9b:1::1')).toBe(true);
+    // Public IPv4 mapped via NAT64
+    expect(isPrivateIp('64:ff9b::1.1.1.1')).toBe(false);
+
+    // Teredo prefix (2001::/32) with inverted private IPv4 127.0.0.1 (0x7f000001 ^ 0xffffffff = 0x80ffffff)
+    // 0x80ff = 33023, 0xffff = 65535
+    expect(isPrivateIp('2001:0:4136:e378:8000:63bf:80ff:ffff')).toBe(true);
+  });
 });

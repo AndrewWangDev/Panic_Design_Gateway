@@ -114,7 +114,9 @@ export async function checkDomainDnsSafety(hostname: string): Promise<boolean> {
       hasNetworkError = true;
     }
     const allIps = [...v4Res.ips, ...v6Res.ips];
-    if (allIps.length > 0 && allIps.every(ip => !isPrivateIp(ip))) {
+    // Strict Fail-Closed (PD-SEC-02): Safe only when both queries succeeded without error,
+    // at least one IP was resolved, and every resolved IP is confirmed public non-private.
+    if (!v4Res.error && !v6Res.error && allIps.length > 0 && allIps.every(ip => !isPrivateIp(ip))) {
       safe = true;
     }
   } catch {
@@ -153,11 +155,22 @@ export function _getDnsCacheEntry(domain: string) {
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-// Zero-Trust CORS Support for Browser SPAs & Web UI Interceptor
+// Zero-Trust CORS Support for Browser SPAs & Web UI Interceptor (PD-CORS-01)
 app.use('*', cors({
   origin: (origin) => origin || '*',
   allowHeaders: ['Authorization', 'X-Chaos-Token', 'x-chaos-token', 'Content-Type', 'Accept', 'X-Requested-With'],
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
+  exposeHeaders: [
+    'x-panic-t2',
+    'x-panic-t3',
+    'x-panic-colo',
+    'x-panic-w1',
+    'x-panic-w3',
+    'X-Chaos-Reason',
+    'X-Chaos-Client-Context',
+    'X-Chaos-Mutilated',
+    'X-Chaos-Mutation-Skipped'
+  ],
   maxAge: 86400
 }))
 
@@ -192,7 +205,7 @@ app.all('*', async (c) => {
       return c.text('Panic Gateway: Invalid or Expired Chaos Token', 401)
     }
 
-    // Step 2: Extract payload and verify against D1 for global revocation
+    // Step 2: Extract payload and verify against D1 for global revocation (PD-GW-01)
     const targetHost = payload.targetHost as string
     const fault = payload.fault as string
     const scope = payload.scope as string || 'Global'
@@ -200,7 +213,7 @@ app.all('*', async (c) => {
     const tokenId = payload.tokenId as string
     const issuedWithSalt = (payload.issuedWithSalt ?? payload.jwtSalt) as number
 
-    if (!targetHost || !userId || !tokenId) {
+    if (!targetHost || typeof targetHost !== 'string' || typeof userId !== 'string' || typeof tokenId !== 'string' || typeof issuedWithSalt !== 'number') {
       return c.text('Panic Gateway: Malformed Chaos Token', 400)
     }
 
@@ -279,7 +292,7 @@ app.all('*', async (c) => {
     if (!row) {
       return c.text('Panic Gateway: Token or User not found', 401)
     }
-    if (Boolean(row.isRevoked) || (issuedWithSalt !== undefined && row.jwtSalt !== issuedWithSalt)) {
+    if (Boolean(row.isRevoked) || row.jwtSalt !== issuedWithSalt) {
       return c.text('Panic Gateway: Token has been revoked', 401)
     }
 
@@ -357,10 +370,12 @@ app.all('*', async (c) => {
     const rayId = c.req.header('cf-ray') || 'unknown';
     const rayColo = rayId.includes('-') ? rayId.split('-')[1]?.toUpperCase() : null;
     const currentColo = (c.req.raw.cf?.colo as string) || rayColo || 'EDGE';
+    const incomingReqUrl = new URL(c.req.url);
+    const fullTargetUrl = `https://${targetHost}${incomingReqUrl.pathname}${incomingReqUrl.search}`;
 
     if (!failOpenMode) {
       if (fault === '502') {
-      logTelemetryAsync(c, payload, { statusCode: 502, latencyAdded: 0, rayId, edgeColo: currentColo });
+      logTelemetryAsync(c, payload, { targetUrl: fullTargetUrl, statusCode: 502, latencyAdded: 0, rayId, edgeColo: currentColo });
       return new Response(JSON.stringify({
         error: {
           code: "bad_gateway",
@@ -378,7 +393,7 @@ app.all('*', async (c) => {
     }
     if (fault === '504') {
       await new Promise(r => setTimeout(r, 2000));
-      logTelemetryAsync(c, payload, { statusCode: 504, latencyAdded: 2000, rayId, edgeColo: currentColo });
+      logTelemetryAsync(c, payload, { targetUrl: fullTargetUrl, statusCode: 504, latencyAdded: 2000, rayId, edgeColo: currentColo });
       return new Response(JSON.stringify({
         error: {
           code: "gateway_timeout",
@@ -395,7 +410,7 @@ app.all('*', async (c) => {
       });
     }
     if (fault === '429') {
-      logTelemetryAsync(c, payload, { statusCode: 429, latencyAdded: 0, rayId, edgeColo: currentColo });
+      logTelemetryAsync(c, payload, { targetUrl: fullTargetUrl, statusCode: 429, latencyAdded: 0, rayId, edgeColo: currentColo });
       return new Response(JSON.stringify({
         error: {
           code: "rate_limit_exceeded",
@@ -413,7 +428,7 @@ app.all('*', async (c) => {
       });
     }
     if (fault === '444') {
-      logTelemetryAsync(c, payload, { statusCode: 444, latencyAdded: 0, rayId, edgeColo: currentColo });
+      logTelemetryAsync(c, payload, { targetUrl: fullTargetUrl, statusCode: 444, latencyAdded: 0, rayId, edgeColo: currentColo });
       return new Response('', {
         status: 444,
         statusText: 'No Response',
@@ -431,7 +446,7 @@ app.all('*', async (c) => {
       }
       
       if (shouldDrop) {
-        logTelemetryAsync(c, payload, { statusCode: 444, latencyAdded: 0, rayId, edgeColo: currentColo });
+        logTelemetryAsync(c, payload, { targetUrl: fullTargetUrl, statusCode: 444, latencyAdded: 0, rayId, edgeColo: currentColo });
         return new Response('', {
           status: 444,
           statusText: 'No Response',
@@ -547,26 +562,29 @@ app.all('*', async (c) => {
       const response = await fetch(newReq);
       const t3 = Date.now() - startT3;
 
-      // Start telemetry async with authentic upstream response status
-      try {
-        logTelemetryAsync(c, payload, {
-          targetUrl: url.toString(),
-          latencyAdded: finalDelay,
-          statusCode: response.status,
-          rayId,
-          edgeColo: currentColo,
-          isFailOpen: failOpenMode
-        });
-      } catch (e: any) {
-        console.error('Telemetry synchronous error:', e);
-      }
-
       let resBody: any = response.body;
       const newHeaders = new Headers(response.headers);
       stripHopByHopHeaders(newHeaders);
+
+      // PD-SEC-01: CORS credential reflection defense
+      const reqOrigin = c.req.header('Origin') || '';
+      const isTrustedOrigin = reqOrigin === 'https://panic.andrewwangdev.com' || /^https:\/\/.*\.panicdesign\.pages\.dev$/i.test(reqOrigin);
+      if (!isTrustedOrigin && newHeaders.get('access-control-allow-credentials')?.toLowerCase() === 'true') {
+        newHeaders.delete('access-control-allow-credentials');
+      }
+
+      // PD-SEC-01: Defensive security headers for all proxied responses
+      newHeaders.set('X-Content-Type-Options', 'nosniff');
+      newHeaders.set('Content-Security-Policy', "sandbox; default-src 'none';");
+
+      // PD-BUG-01: Null-body responses (101, 204, 205, 304, or HEAD) cannot have a body per Fetch standard
+      const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
+      const isNullBody = NULL_BODY_STATUSES.has(response.status) || c.req.method === 'HEAD';
       const MAX_MUTILATION_BYTES = 2 * 1024 * 1024; // 2MB Worker memory safety cap
 
-      if (!failOpenMode && fault === 'latency' && mutilation !== 'None') {
+      if (isNullBody) {
+        resBody = null;
+      } else if (!failOpenMode && fault === 'latency' && mutilation !== 'None') {
         if (mutilation === 'Empty Shell') {
           await response.body?.cancel().catch(() => {});
           newHeaders.delete('content-length');
@@ -644,6 +662,20 @@ app.all('*', async (c) => {
         statusText: response.statusText,
         headers: newHeaders
       });
+
+      // Start telemetry async with authentic upstream response status only AFTER successful new Response instantiation (PD-BUG-01)
+      try {
+        logTelemetryAsync(c, payload, {
+          targetUrl: url.toString(),
+          latencyAdded: finalDelay,
+          statusCode: response.status,
+          rayId,
+          edgeColo: currentColo,
+          isFailOpen: failOpenMode
+        });
+      } catch (e: any) {
+        console.error('Telemetry synchronous error:', e);
+      }
       
       if (failOpenMode) {
         newRes.headers.set('X-Chaos-Reason', `Policy Scope Mismatch (${failOpenReason})`);
@@ -721,9 +753,9 @@ function logTelemetryAsync(c: any, payload: any, options: TelemetryOptions = {})
     const fault = options.isFailOpen ? 'PASSTHROUGH' : payload.fault;
     const source = payload.source || 'DIRECT_DATA_PLANE';
     
-    // Extract genuine JWT token hint from request or payload
+    // Extract genuine JWT token hint from request or payload (PD-GW-01: Header first)
     let tokenHint: string | null = null;
-    const rawToken = c.req.query('token') || c.req.header('X-Chaos-Token') || (c.req.header('Authorization')?.replace(/^Bearer\s+/i, '')) || '';
+    const rawToken = c.req.header('X-Chaos-Token') || (c.req.header('Authorization')?.replace(/^Bearer\s+/i, '')) || c.req.query('token') || '';
     if (rawToken && rawToken.startsWith('eyJ')) {
       tokenHint = `eyJhbGci...${rawToken.slice(-4)}`;
     } else if (typeof payload.tokenHint === 'string' && payload.tokenHint.startsWith('eyJ')) {
@@ -838,7 +870,18 @@ function getColoCoordinates(colo: string): string {
     'EWR': [-74.1745, 40.6895],  // Newark / NYC
     'AMS': [4.9041, 52.3676],    // Amsterdam
     'BOM': [72.8777, 19.0760],   // Mumbai
-    'GRU': [-46.6333, -23.5505]  // Sao Paulo
+    'GRU': [-46.6333, -23.5505], // Sao Paulo
+    'DFW': [-97.0403, 32.8998],  // Dallas
+    'ATL': [-84.4277, 33.6407],  // Atlanta
+    'MIA': [-80.2870, 25.7959],  // Miami
+    'ORD': [-87.9073, 41.9742],  // Chicago
+    'SEA': [-122.3088, 47.4502], // Seattle
+    'DEN': [-104.6737, 39.8561], // Denver
+    'IAH': [-95.3368, 29.9902],  // Houston
+    'BOS': [-71.0096, 42.3656],  // Boston
+    'PHX': [-112.0078, 33.4373], // Phoenix
+    'YYZ': [-79.6248, 43.6777],  // Toronto
+    'YVR': [-123.1844, 49.1967]  // Vancouver
   };
   
   if (coloMap[colo]) {
@@ -849,6 +892,10 @@ function getColoCoordinates(colo: string): string {
 }
 
 function stripHopByHopHeaders(headers: Headers): void {
+  // PD-SEC-01: Strip upstream Set-Cookie / Set-Cookie2 headers to prevent parent-domain cookie tossing
+  headers.delete('set-cookie');
+  headers.delete('set-cookie2');
+
   const connectionVal = headers.get('connection');
   if (connectionVal) {
     for (const name of connectionVal.split(',')) {
@@ -1151,6 +1198,35 @@ export function isPrivateIp(ip: string): boolean {
       const b1 = words[1] & 0xff;
       const b2 = (words[2] >> 8) & 0xff;
       const b3 = words[2] & 0xff;
+      return isPrivateIpv4Octets(b0, b1, b2, b3);
+    }
+
+    // 13. NAT64 Well-Known Prefix (64:ff9b::/96, RFC 6052)
+    if (words[0] === 0x0064 && words[1] === 0xff9b && words[2] === 0 && words[3] === 0 && words[4] === 0 && words[5] === 0) {
+      const b0 = (words[6] >> 8) & 0xff;
+      const b1 = words[6] & 0xff;
+      const b2 = (words[7] >> 8) & 0xff;
+      const b3 = words[7] & 0xff;
+      return isPrivateIpv4Octets(b0, b1, b2, b3);
+    }
+
+    // 14. NAT64 Local-Use Prefix (64:ff9b:1::/48, RFC 8215)
+    if (words[0] === 0x0064 && words[1] === 0xff9b && words[2] === 0x0001) {
+      return true;
+    }
+
+    // 15. Teredo Prefix (2001::/32, RFC 4380)
+    if (words[0] === 0x2001 && words[1] === 0x0000) {
+      const s0 = (words[2] >> 8) & 0xff;
+      const s1 = words[2] & 0xff;
+      const s2 = (words[3] >> 8) & 0xff;
+      const s3 = words[3] & 0xff;
+      if (isPrivateIpv4Octets(s0, s1, s2, s3)) return true;
+
+      const b0 = ((words[6] >> 8) & 0xff) ^ 0xff;
+      const b1 = (words[6] & 0xff) ^ 0xff;
+      const b2 = ((words[7] >> 8) & 0xff) ^ 0xff;
+      const b3 = (words[7] & 0xff) ^ 0xff;
       return isPrivateIpv4Octets(b0, b1, b2, b3);
     }
 
