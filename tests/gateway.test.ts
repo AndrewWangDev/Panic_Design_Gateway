@@ -860,4 +860,66 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     // 0x80ff = 33023, 0xffff = 65535
     expect(isPrivateIp('2001:0:4136:e378:8000:63bf:80ff:ffff')).toBe(true);
   });
+
+  it('should fail closed when DoH returns Status: 2 (SERVFAIL) on AAAA (PD-SEC-02)', async () => {
+    const originalFetch = globalThis.fetch;
+    _clearRevocationCache();
+
+    globalThis.fetch = vi.fn().mockImplementation(async (req: any) => {
+      const urlStr = typeof req === 'string' ? req : req.url;
+      if (urlStr.includes('type=AAAA')) {
+        // AAAA returns SERVFAIL (Status: 2)
+        return new Response(JSON.stringify({
+          Status: 2
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        Status: 0,
+        Answer: [{ type: 1, data: '93.184.216.34' }]
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+
+    try {
+      const domain = 'servfail-test-domain.com';
+      const safe = await checkDomainDnsSafety(domain);
+      expect(safe).toBe(false);
+      // Ensure it was NOT cached as safe
+      expect(_getDnsCacheEntry(domain)?.safe).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should bracket bare IPv6 targetHost in early-exit fault telemetry (PD-NEW-02)', async () => {
+    let loggedTarget: string | null = null;
+    const testDb = {
+      prepare: (sql: string) => ({
+        bind: (...args: any[]) => {
+          if (sql.includes('INSERT INTO ChaosLog')) {
+            loggedTarget = args[2];
+          }
+          return {
+            first: async () => ({ jwtSalt: 0, isRevoked: 0 }),
+            run: async () => ({ success: true })
+          };
+        }
+      })
+    };
+
+    const token = await generateTestToken({
+      targetHost: '2606:4700:4700::1111',
+      fault: '502'
+    });
+
+    const res = await app.request('https://gateway.andrewwangdev.com/v1/api', {
+      headers: {
+        'X-Chaos-Token': token
+      }
+    }, {
+      CHAOS_JWT_SECRET: TEST_SECRET,
+      DB: testDb as any
+    });
+    expect(res.status).toBe(502);
+    expect(loggedTarget).toBe('https://[2606:4700:4700::1111]/v1/api');
+  });
 });

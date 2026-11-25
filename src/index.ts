@@ -102,7 +102,12 @@ export async function checkDomainDnsSafety(hostname: string): Promise<boolean> {
             .map((a: any) => a.data);
           return { ips, error: false };
         }
-        return { ips: [], error: false };
+        // Status 0 without answer (NODATA) or Status 3 (NXDOMAIN) are benign negative responses
+        if (data && (data.Status === 0 || data.Status === 3)) {
+          return { ips: [], error: false };
+        }
+        // Any other DNS status (Status 2 SERVFAIL, Status 5 REFUSED, etc.) is a resolution error (PD-SEC-02)
+        return { ips: [], error: true };
       } catch {
         // Fall back to an empty record set on network errors or timeouts without polluting long-term negative cache
         return { ips: [], error: true };
@@ -371,7 +376,8 @@ app.all('*', async (c) => {
     const rayColo = rayId.includes('-') ? rayId.split('-')[1]?.toUpperCase() : null;
     const currentColo = (c.req.raw.cf?.colo as string) || rayColo || 'EDGE';
     const incomingReqUrl = new URL(c.req.url);
-    const fullTargetUrl = `https://${targetHost}${incomingReqUrl.pathname}${incomingReqUrl.search}`;
+    const hostForUrl = targetHost.includes(':') && !targetHost.startsWith('[') ? `[${targetHost}]` : targetHost;
+    const fullTargetUrl = `https://${hostForUrl}${incomingReqUrl.pathname}${incomingReqUrl.search}`;
 
     if (!failOpenMode) {
       if (fault === '502') {
@@ -566,12 +572,8 @@ app.all('*', async (c) => {
       const newHeaders = new Headers(response.headers);
       stripHopByHopHeaders(newHeaders);
 
-      // PD-SEC-01: CORS credential reflection defense
-      const reqOrigin = c.req.header('Origin') || '';
-      const isTrustedOrigin = reqOrigin === 'https://panic.andrewwangdev.com' || /^https:\/\/.*\.panicdesign\.pages\.dev$/i.test(reqOrigin);
-      if (!isTrustedOrigin && newHeaders.get('access-control-allow-credentials')?.toLowerCase() === 'true') {
-        newHeaders.delete('access-control-allow-credentials');
-      }
+      // PD-SEC-01 & PD-NEW-02: CORS credential reflection defense - unconditionally strip upstream credentials header
+      newHeaders.delete('access-control-allow-credentials');
 
       // PD-SEC-01: Defensive security headers for all proxied responses
       newHeaders.set('X-Content-Type-Options', 'nosniff');
