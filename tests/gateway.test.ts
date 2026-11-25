@@ -922,4 +922,37 @@ describe('Data Plane: Gateway Ingress & Fault Engine', () => {
     expect(res.status).toBe(502);
     expect(loggedTarget).toBe('https://[2606:4700:4700::1111]/v1/api');
   });
+
+  it('should NOT bracket host:port targetHost in early-exit fault telemetry (PD-NEW-03)', async () => {
+    let loggedTarget: string | null = null;
+    const testDb = {
+      prepare: (sql: string) => ({
+        bind: (...args: any[]) => {
+          if (sql.includes('INSERT INTO ChaosLog')) {
+            loggedTarget = args[2];
+          }
+          return {
+            first: async () => ({ jwtSalt: 0, isRevoked: 0 }),
+            run: async () => ({ success: true })
+          };
+        }
+      })
+    };
+
+    const token = await generateTestToken({
+      targetHost: '1.1.1.1:8443',
+      fault: '502'
+    });
+
+    const res = await app.request('https://gateway.andrewwangdev.com/v1/api', {
+      headers: {
+        'X-Chaos-Token': token
+      }
+    }, {
+      CHAOS_JWT_SECRET: TEST_SECRET,
+      DB: testDb as any
+    });
+    expect(res.status).toBe(502);
+    expect(loggedTarget).toBe('https://1.1.1.1:8443/v1/api');
+  });
 });

@@ -376,7 +376,8 @@ app.all('*', async (c) => {
     const rayColo = rayId.includes('-') ? rayId.split('-')[1]?.toUpperCase() : null;
     const currentColo = (c.req.raw.cf?.colo as string) || rayColo || 'EDGE';
     const incomingReqUrl = new URL(c.req.url);
-    const hostForUrl = targetHost.includes(':') && !targetHost.startsWith('[') ? `[${targetHost}]` : targetHost;
+    const isBareIPv6 = targetHost.includes(':') && !targetHost.startsWith('[') && (targetHost.includes('::') || targetHost.split(':').length > 2);
+    const hostForUrl = isBareIPv6 ? `[${targetHost}]` : targetHost;
     const fullTargetUrl = `https://${hostForUrl}${incomingReqUrl.pathname}${incomingReqUrl.search}`;
 
     if (!failOpenMode) {
